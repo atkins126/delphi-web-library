@@ -7,11 +7,12 @@ const
 
   Param_ACMEPort = 'ACMEport'; ParamDef_ACMEPort = 80;
   Param_ACMEDomain = 'ACMEDomain';
-  Param_ACMECountryCode = 'ACMECountryCode';
+  Param_ACMECountry = 'ACMECountry';
   Param_ACMEState = 'ACMEState';
   Param_ACMECity = 'ACMECity';
   Param_RestPort = 'RestPort'; ParamDef_RestPort = 443;
-  Param_RestIP = 'RestIP';
+  Param_Binding_IP = 'Binding_IP';
+  Param_Binding_Port = 'Binding_Port';
   Param_DLLBasePath = 'DLLBasePath';
 
   Param_FeedConfigProc = 'feedconfigproc';

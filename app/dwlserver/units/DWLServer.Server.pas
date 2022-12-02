@@ -4,7 +4,7 @@ interface
 
 uses
   System.Threading, DWL.Params, DWL.HTTP.Server.Handler.Log, DWL.Logging,
-  DWL.HTTP.Server;
+  DWL.HTTP.Server, DWL.HTTP.Server.Handler.Mail;
 
 type
   TdwlServerCore = class
@@ -39,11 +39,11 @@ uses
   System.Rtti, DWL.Params.Consts, DWL.Logging.Callback, System.StrUtils,
   DWL.MySQL, DWL.HTTP.Server.Types, DWL.HTTP.Server.Handler.DLL,
   System.Generics.Collections, Winapi.Windows, Winapi.ShLwApi, DWLServer.Consts,
-  DWL.HTTP.Consts, DWL.Mail.Queue;
+  DWL.HTTP.Consts, DWL.Mail.Queue, IdAssignedNumbers, System.Math;
 
 const
   SQL_CheckTable_Handlers =
-    'CREATE TABLE IF NOT EXISTS dwl_handlers (id int AUTO_INCREMENT, endpoint varchar(50), handler_uri varchar(255), authentication_endpoint VARCHAR(50), authorization_endpoint VARCHAR(50), `params` TEXT NULL, INDEX `primaryindex` (`id`))';
+    'CREATE TABLE IF NOT EXISTS dwl_handlers (id int AUTO_INCREMENT, endpoint varchar(50), handler_uri varchar(255), `params` TEXT NULL, INDEX `primaryindex` (`id`))';
   SQL_CheckTable_UriAliases =
     'CREATE TABLE IF NOT EXISTS dwl_urialiases (id int AUTO_INCREMENT, alias varchar(255), uri varchar(255), PRIMARY KEY (id))';
   SQL_Get_UriAliases =
@@ -121,31 +121,49 @@ begin
     FMySQL_Profile := New_Params;
     FParams.AssignTo(FMySQL_Profile, Params_SQLConnection);
     InitDatabase;
-    TdwlMailQueue.Configure(FParams);
     FLogHandler := TdwlHTTPHandler_Log.Create(FParams); // init before activating DoLog!
+    TdwlMailQueue.Configure(FParams, true);
     EnableLogDispatchingToCallback(false, DoLog);
     ACMECLient := TdwlACMEClient.Create;
     try
       ACMECLient.Domain := FParams.StrValue(Param_ACMEDomain);
-      ACMECLient.ProfileCountryCode := FParams.StrValue(Param_ACMECountryCode);
+      ACMECLient.ProfileCountryCode := FParams.StrValue(Param_ACMECountry);
       ACMECLient.ProfileState := FParams.StrValue(Param_ACMEState);
       ACMECLient.ProfileCity := FParams.StrValue(Param_ACMECity);
       ACMEClient.CallBackPortNumber := FParams.IntValue(Param_ACMEPort, ParamDef_ACMEPort);
       HTTPServer := TdwlHTTPServer.Create;
       try
-//        RestServer.IP := FParams.StrValue(Param_RestIP);
-//        ACMECLient.ChallengeIP := RestServer.IP;
+        var IP := FParams.StrValue(Param_Binding_IP);
+        if IP<>'' then
+        begin
+          TdwlLogger.Log('Bound to specific IP '+IP, lsTrace);
+          ACMECLient.ChallengeIP := IP;
+        end;
         CheckACME;
+        var Port: integer;
+        if not FParams.TryGetIntValue(Param_Binding_Port, Port) then
+        begin
+          if HTTPServer.IsSecure then
+            Port := IdPORT_https
+          else
+            Port := IdPORT_HTTP;
+        end;
+        var Binding := HTTPServer.Bindings.Add;
+        if IP<>'' then
+          Binding.IP := IP;
+        Binding.Port := Port;
+        TdwlLogger.Log('Bound to '+IfThen(Binding.IP='', '*', Binding.IP)+':'+Binding.Port.ToString);
         LoadURIAliases(HTTPServer);
         HTTPServer.Open;
         HTTPServer.RegisterHandler(EndpointURI_Log,  FLogHandler);
+        HTTPServer.RegisterHandler(EndpointURI_Mail,  TdwlHTTPHandler_Mail.Create(FParams));
         HTTPServer.LogLevel := FParams.IntValue(Param_LogLevel, httplogLevelWarning);
         TdwlLogger.Log('Enabled Request logging (level '+HTTPServer.LogLevel.ToString+')', lsTrace);
         if not HTTPServer.IsSecure then
           TdwlLogger.Log('SERVER IS NOT SECURE, please configure or review ACME parameters', lsWarning);
         TdwlLogger.Log('Opened HTTP Server', lsNotice);
         FDLLBasePath := FParams.StrValue('DLLBasePath', ExtractFileDir(ParamStr(0)));
-        if {$IFDEF DEBUG}true{$ELSE}RestServer.IsSecure{$ENDIF} then
+        if {$IFDEF DEBUG}true{$ELSE}HTTPServer.IsSecure{$ENDIF} then
           LoadDLLHandlers(HTTPServer)
         else
           TdwlLogger.Log('Skipped loading of handlers because server is not secure', lsWarning);
@@ -209,6 +227,14 @@ var
   Handler: TdwlHTTPHandler_DLL;
   CreatedHandlers: TList<TdwlHTTPHandler_DLL>;
 begin
+  FParams.WriteValue(Param_BaseURI, HTTPServer.BaseURI);
+  var Issuer := FParams.StrValue(Param_Issuer);
+  if Issuer='' then
+  begin
+    Issuer :=  FParams.StrValue(Param_BaseURI)+Default_EndpointURI_OAuth2;
+    TdwlLogger.Log('No issuer configured, default applied: '+Issuer, lsNotice);
+    FParams.WriteValue(Param_Issuer, Issuer);
+  end;
   try
     Cmd := New_MySQLSession(FMySQL_Profile).CreateCommand(SQL_Get_Resthandlers);
     Cmd.Execute;
@@ -224,7 +250,6 @@ begin
           HandlerParams.WriteNameValueText(Cmd.Reader.GetString(2 ,true));
           if not HandlerParams.BoolValue(Param_Enabled, true) then
             Continue;
-          HandlerParams.WriteValue(Param_BaseURI, HTTPServer.BaseURI);
           HandlerParams.WriteValue(Param_Endpoint, Endpoint);
           HTTPServer.SuspendHandling;
           try
@@ -314,7 +339,8 @@ end;
 procedure TdwlServerCore.Stop;
 begin
   FIsStopping := true;
-  FExecutionTask.Wait(5000);
+  if FExecutionTask<>nil then
+    FExecutionTask.Wait(5000);
 end;
 
 end.

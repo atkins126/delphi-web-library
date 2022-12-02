@@ -55,6 +55,7 @@ type
     procedure HTTPServerCommand(AContext: TIdContext; ARequestInfo: TIdHTTPRequestInfo; AResponseInfo: TIdHTTPResponseInfo);
     procedure HTTPServerDisconnect(AContext: TIdContext);
     procedure HTTPServerParseAuthentication(AContext: TIdContext; const AAuthType, AAuthData: String; var VUsername, VPassword: String; var VHandled: Boolean);
+    procedure QuerySSLPort(APort: Word; var VUseSSL: boolean);
     function GetActive: boolean;
   public
     /// <summary>
@@ -182,7 +183,7 @@ uses
   IdGlobal, IdHashSHA,
   System.NetEncoding, IdSSLOpenSSL, DWL.Logging, DWL.HTTP.Consts,
   IdAssignedNumbers, System.StrUtils, DWL.HTTP.Server.Utils,
-  DWL.HTTP.Server.Globals, DWL.HTTP.Utils;
+  DWL.HTTP.Server.Globals, DWL.HTTP.Utils, DWL.Classes;
 
 type
   TdwlHTTPHandler_PassThrough = class(TdwlHTTPHandler)
@@ -277,7 +278,8 @@ begin
     if Assigned(PServerStructure(State._InternalServerStructure).FinalHandler) and
       Assigned(PServerStructure(State._InternalServerStructure).FinalHandler.FWrapupProc) then
       PServerStructure(State._InternalServerStructure).FinalHandler.FWrapupProc(State);
-    FreeMem(State._InternalServerStructure);
+    PServerStructure(State._InternalServerStructure).State_URI := ''; // dispose string
+    Freemem(State._InternalServerStructure);
     FreeMem(State);
   end;
 end;
@@ -398,7 +400,7 @@ begin
   Result := FHTTPServer.Bindings;
 end;
 
-procedure State_AllocateContentBuffer(const State: PdwlHTTPHandlingState; var ContentBuffer: pointer; const ContentLength: cardinal); stdcall;
+procedure State_ArrangeContentBuffer(const State: PdwlHTTPHandlingState; var ContentBuffer: pointer; const ContentLength: cardinal); stdcall;
 begin
   Assert(PServerStructure(State._InternalServerStructure).ContentBuffer=nil);
   var Owned := ContentBuffer=nil;
@@ -499,6 +501,7 @@ begin
   end
   else
     Result := -1;
+  ValueCharCnt := FoundStrCharCount;
 end;
 
 procedure State_SetHeaderValue(const State: PdwlHTTPHandlingState; const HeaderKey, Value: PWideChar); stdcall;
@@ -580,18 +583,6 @@ begin
   TdwlLogger.Log('Rq '+Binding.PeerIP+':'+Binding.Port.ToString+' '+dwlhttpCommandToString[State.Command]+' '+State.URI+' '+State.StatusCode.ToString+' (websocket opened)', lsTrace);
 end;
 
-type
-  TContentStream = class(TCustomMemoryStream)
-  public
-    constructor Create(ContentBuffer: pointer; ContentSize: NativeInt);
-  end;
-
-constructor TContentStream.Create(ContentBuffer: pointer; ContentSize: NativeInt);
-begin
-  inherited Create;
-  SetPointer(ContentBuffer, ContentSize);
-end;
-
 procedure TdwlHTTPServer.HTTPServerCommand(AContext: TIdContext; ARequestInfo: TIdHTTPRequestInfo; AResponseInfo: TIdHTTPResponseInfo);
 begin
   var State: PdwlHTTPHandlingState := AllocMem(SizeOf(TdwlHTTPHandlingState));
@@ -667,7 +658,7 @@ begin
   else
   begin
     AResponseInfo.ResponseNo := State.StatusCode;
-    AResponseInfo.ContentStream := TContentStream.Create(PServerStructure(State._InternalServerStructure).ContentBuffer, PServerStructure(State._InternalServerStructure).ContentLength);
+    AResponseInfo.ContentStream := TdwlReadOnlyBufferStream.Create(PServerStructure(State._InternalServerStructure).ContentBuffer, PServerStructure(State._InternalServerStructure).ContentLength);
   end;
 end;
 
@@ -683,11 +674,14 @@ begin
     HandleSSL.SSLOptions.KeyFile := FSSL_PrivateKeyFileName;
     HandleSSL.SSLOptions.SSLVersions := [sslvTLSv1, sslvTLSv1_1, sslvTLSv1_2];
     FHTTPServer.IOHandler := HandleSSL;
-    FHTTPServer.DefaultPort := IdPORT_https;
-  end
-  else
-    FHTTPServer.DefaultPort := IdPORT_https;
+  end;
+  FHTTPServer.OnQuerySSLPort := QuerySSLPort;
   FHTTPServer.Active := true;
+end;
+
+procedure TdwlHTTPServer.QuerySSLPort(APort: Word; var VUseSSL: boolean);
+begin
+  VUseSSL := IsSecure;
 end;
 
 procedure TdwlHTTPServer.RegisterHandler(const URI: string; Handler: TdwlHTTPHandler);
@@ -867,7 +861,7 @@ begin
 end;
 
 initialization
-  serverProcs.AllocateContentBufferProc := State_AllocateContentBuffer;
+  serverProcs.ArrangeContentBufferProc := State_ArrangeContentBuffer;
   serverProcs.GetRequestParamProc := State_GetRequestParam;
   serverProcs.GetHeaderValueProc := State_GetHeaderValue;
   serverProcs.GetPayloadPtrProc := State_GetPostDataPtr;

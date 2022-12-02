@@ -4,7 +4,7 @@ interface
 
 uses
   DWL.Params, IdMessage, System.Generics.Collections, DWL.Logging,
-  System.Classes;
+  System.Classes, System.Rtti;
 
 const
   Param_mailQueue_Domains = 'mailqueue_domains';
@@ -15,6 +15,7 @@ type
   class var
     FParams: IdwlParams;
     FMailSendThread: TThread;
+    class procedure ParamChanged(Sender: IdwlParams; const Key: string; const Value: TValue); static;
   private
   class var
     FMailAddedEvent: THandle;
@@ -27,20 +28,20 @@ type
     /// <summary>
     ///   <para>
     ///     Call Configure to activate the MailQueue. The Params object will
-    ///     'taken' and modified internally within the processor (f.e. when
+    ///     'taken' and when sending is active modified internally within the processor (f.e. when
     ///     refreshtokens are changed), This opens the possibility to attach
     ///     an event to the Params to save the changes persistently.
     ///   </para>
     ///   <para>
     ///     Needed keys: <br />- MySQL configuration related keys like host,
-    ///     username, password and db <br />- mailqueue_domains: a JSON
+    ///     username, password and db <br />- mailqueue_domains (only when sending enabled): a JSON
     ///     string with an array of objects. each object represents a
     ///     delivery domain and needs to contains keys for domain, host,
     ///     port, username, password or endpoint/clientid/refreshtoken in the
     ///     case of oauth2 configuration <br />
     ///   </para>
     /// </summary>
-    class procedure Configure(Params: IdwlParams); static;
+    class procedure Configure(Params: IdwlParams; EnableMailSending: boolean=false); static;
     /// <summary>
     ///   Queues an Indy TIdMessage for sending. Please note ownership of
     ///   the IdMessage is not taken! You have to free it yourself (because you
@@ -54,22 +55,12 @@ implementation
 
 uses
   DWL.MySQL, DWL.Params.Consts, System.JSON, Winapi.Windows, System.SysUtils,
-  IdSMTP, IdSSLOpenSSL, IdSASL, DWL.HTTP.APIClient.OAuth2, DWL.HTTP.APIClient,
-  IdAssignedNumbers, System.Math, IdExplicitTLSClientServerBase, DWL.Classes;
+  IdSMTP, IdSSLOpenSSL, DWL.HTTP.APIClient.OAuth2, DWL.HTTP.APIClient, DWL.Mail.SASL,
+  IdAssignedNumbers, System.Math, IdExplicitTLSClientServerBase, DWL.Classes,
+  DWL.StrUtils;
 
 type
   TdwlMailStatus = (msQueued=0, msRetrying=2, msSent=5, msError=9);
-
-  TIdSASLOAuth2 = class(TIdSASL)
-  private
-    FToken: string;
-    FUser: string;
-  public
-    property Token: string read FToken write FToken;
-    property User: string read FUser write FUser;
-    class function ServiceName: TIdSASLServiceName; override;
-    function StartAuthenticate(const AChallenge, AHost, AProtocolName: string): string; override;
-  end;
 
   TMailSendThread = class(TThread)
   strict private
@@ -90,7 +81,7 @@ type
 
 { TdwlMailQueue }
 
-class procedure TdwlMailQueue.Configure(Params: IdwlParams);
+class procedure TdwlMailQueue.Configure(Params: IdwlParams; EnableMailSending: boolean=false);
 const
   SQL_CheckTable = 'CREATE TABLE IF NOT EXISTS dwl_mailqueue (' +
     'Id INT UNSIGNED NOT NULL AUTO_INCREMENT, ' +
@@ -106,59 +97,63 @@ const
     'INDEX `StatusDelayedUntilIndex` (`Status`, `DelayedUntil`))';
 begin
   FParams := Params;
-  FParams.WriteValue(Param_CreateDatabase, true);
-  FParams.WriteValue(Param_TestConnection, true);
-  var Session := New_MySQLSession(FParams);
-  FParams.ClearKey(Param_CreateDatabase);
-  FParams.ClearKey(Param_TestConnection);
-  SeSsion.CreateCommand(SQL_CheckTable).Execute;
-  FDomainContexts := TDictionary<string, IdwlParams>.Create;
-  var DomainContextStr := FParams.StrValue(Param_mailQueue_Domains);
-  if DomainContextStr<>'' then
+  if EnableMailSending then
   begin
-    var JSON := TJSONObject.ParseJSONValue(DomainContextStr);
-    try
-      if JSON is TJSONArray then
-      begin
-        var Enum := TJSONArray(JSON).GetEnumerator;
-        try
-          while ENum.MoveNext do
-          begin
-            if not (ENum.Current is TJSONObject) then
+    FParams.WriteValue(Param_CreateDatabase, true);
+    FParams.WriteValue(Param_TestConnection, true);
+    var Session := New_MySQLSession(FParams);
+    FParams.ClearKey(Param_CreateDatabase);
+    FParams.ClearKey(Param_TestConnection);
+    SeSsion.CreateCommand(SQL_CheckTable).Execute;
+    FDomainContexts := TDictionary<string, IdwlParams>.Create;
+    var DomainContextStr := FParams.StrValue(Param_mailQueue_Domains);
+    if DomainContextStr<>'' then
+    begin
+      var JSON := TJSONObject.ParseJSONValue(DomainContextStr);
+      try
+        if JSON is TJSONArray then
+        begin
+          var Enum := TJSONArray(JSON).GetEnumerator;
+          try
+            while ENum.MoveNext do
             begin
-              Log('Configured mailqueue_domains array contains a non-object entry', lsError);
-              Break;
-            end;
-            var DomainParams := New_Params;
-            DomainParams.WriteJSON(TJSONObject(ENum.Current));
-            var Domain: string;
-            if not DomainParams.TryGetStrValue('domain', Domain) then
-              Log('Missing domain in on of the configured contexts', lsError)
-            else
-            begin
-              if Domain='*' then
-                FDefaultDomainContextParams := DomainParams
+              if not (ENum.Current is TJSONObject) then
+              begin
+                Log('Configured mailqueue_domains array contains a non-object entry', lsError);
+                Break;
+              end;
+              var DomainParams := New_Params;
+              DomainParams.WriteJSON(TJSONObject(ENum.Current));
+              var Domain: string;
+              if not DomainParams.TryGetStrValue('domain', Domain) then
+                Log('Missing domain in on of the configured contexts', lsError)
               else
-                FDomainContexts.Add(Domain, DomainParams);
+              begin
+                DomainParams.EnableChangeTracking(ParamChanged);
+                if Domain='*' then
+                  FDefaultDomainContextParams := DomainParams
+                else
+                  FDomainContexts.Add(Domain, DomainParams);
+              end;
             end;
+          finally
+            Enum.Free;
           end;
-        finally
-          Enum.Free;
-        end;
-      end
-      else
-        Log('Configured mailqueue_domains is not an JSON array', lsError);
-    finally
-      JSON.Free;
+        end
+        else
+          Log('Configured mailqueue_domains is not an JSON array', lsError);
+      finally
+        JSON.Free;
+      end;
     end;
-  end;
-  if FDomainContexts.Count=0 then
-    Log('No domains configured, mail will not be processed', lsWarning)
-  else
-  begin
-    var ThreadParams := New_Params;
-    FParams.AssignTo(ThreadParams, Params_SQLConnection);
-    FMailSendThread := TMailSendThread.Create(ThreadParams);
+    if FDomainContexts.Count=0 then
+      Log('No domains configured, mail will not be processed', lsWarning)
+    else
+    begin
+      var ThreadParams := New_Params;
+      FParams.AssignTo(ThreadParams, Params_SQLConnection);
+      FMailSendThread := TMailSendThread.Create(ThreadParams);
+    end;
   end;
 end;
 
@@ -188,6 +183,44 @@ begin
   TdwlLogger.Log(Msg, SeverityLevel, '', 'mailqueue');
 end;
 
+class procedure TdwlMailQueue.ParamChanged(Sender: IdwlParams; const Key: string; const Value: TValue);
+const
+  SQL_InsertOrUpdateParameter=
+    'INSERT INTO dwl_parameters (`Key`, `Value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `Value`=VALUES(`Value`)';
+begin
+  // effectivly the only thing that is written to Params is a new refreshtoken
+  // we need to save it back into the database
+  if Key=Param_Refreshtoken then // just to be sure (and for documentation purposes ;-)
+  begin
+    var JSONArray := TJSONArray.Create;
+    try
+      if FDefaultDomainContextParams<>NIL then
+      begin
+        var JSONObject := TJSONObject.Create;
+        JSONArray.Add(JSOnObject);
+        FDefaultDomainContextParams.PutIntoJSONObject(JSONObject);
+      end;
+      var ENum := FDomainContexts.GetEnumerator;
+      try
+        while ENum.MoveNext do
+        begin
+          var JSONObject := TJSONObject.Create;
+          JSONArray.Add(JSOnObject);
+          ENum.Current.Value.PutIntoJSONObject(JSONObject);
+        end;
+      finally
+        ENum.Free;
+      end;
+      var Cmd := New_MySQLSession(FParams).CreateCommand(SQL_InsertOrUpdateParameter);
+      Cmd.Parameters.SetTextDataBinding(0, Param_mailQueue_Domains);
+      Cmd.Parameters.SetTextDataBinding(1, JSONArray.ToJSON);
+      Cmd.Execute;
+    finally
+      JSONArray.Free;
+    end;
+  end;
+end;
+
 class procedure TdwlMailQueue.QueueForSending(Msg: TIdMessage);
 const
   SQL_InsertInQueue = 'INSERT INTO dwl_mailqueue (bccrecipients, eml) VALUES (?, ?)';
@@ -202,10 +235,10 @@ begin
     Cmd.Parameters.SetTextDataBinding(0, Msg.BccList.EMailAddresses);
     Cmd.Parameters.SetTextDataBinding(1, Str.ReadString(MaxInt));
     Cmd.Execute;
+    SetEvent(FMailAddedEvent);
   finally
     Str.Free;
   end;
-  SetEvent(FMailAddedEvent);
 end;
 
 { TMailSendThread }
@@ -218,6 +251,7 @@ end;
 
 procedure TMailSendThread.Execute;
 begin
+  Sleep(1000); // Let logging handler in server initialize
   while not Terminated do
   begin
     Process;
@@ -237,13 +271,14 @@ end;
 procedure TMailSendThread.Process;
 const
   SQL_GetQueuedMail =
-    'SELECT Id, eml, bccrecipients, Attempts FROM dwl_mailqueue '+
+    'SELECT Id, eml, bccrecipients, Attempts, processinglog FROM dwl_mailqueue '+
     'WHERE (Status<?) and ((DelayedUntil is NULL) or (DelayedUntil<=CURRENT_TIMESTAMP())) '+
     'and ((Attempts IS NULL) or (Attempts<?)) ORDER BY Status, DelayedUntil';
-  SQL_UPDATE_part1 = 'UPDATE dwl_mailqueue SET status=';
-  SQL_UPDATE_part3_Complete = ', attempts=?, momentsent=CURRENT_TIMESTAMP() WHERE id=?';
-  SQL_UPDATE_part3_Retry = ', attempts=?, DelayedUntil=DATE_ADD(CURRENT_TIMESTAMP(), INTERVAL 5 MINUTE) WHERE id=?';
-  SQL_UPDATE_part3_Error = ', attempts=?, DelayedUntil=NULL WHERE id=?';
+  SQL_UPDATE_part1 = 'UPDATE dwl_mailqueue SET processinglog=?, attempts=?, status=';
+  SQL_UPDATE_part2_Complete = ', DelayedUntil=NULL, momentsent=CURRENT_TIMESTAMP()';
+  SQL_UPDATE_part2_Retry = ', DelayedUntil=DATE_ADD(CURRENT_TIMESTAMP(), INTERVAL 5 MINUTE)';
+  SQL_UPDATE_part2_Error = ', DelayedUntil=NULL';
+  SQL_UPDATE_part3 = ' WHERE id=?';
   MAX_ATTEMPTS = 5;
 begin
   try
@@ -257,6 +292,7 @@ begin
     begin
       var Current_ID := Reader.GetInteger(0);
       var Attempts := Reader.GetInteger(3, true);
+      var ProcessingLog := Reader.GetString(4, true);
       inc(Attempts);
       var Str := TStringStream.Create(Reader.GetString(1));
       try
@@ -267,22 +303,25 @@ begin
           var Update_SQL := SQL_UPDATE_part1;
           var Res := ProcessMsg(Msg);
           if Res.Success then
-            Update_SQL := Update_SQL+byte(msSent).ToString+SQL_UPDATE_part3_Complete
+            Update_SQL := Update_SQL+byte(msSent).ToString+SQL_UPDATE_part2_Complete
           else
           begin
             if Attempts=MAX_ATTEMPTS then
-              Update_SQL := Update_SQL+byte(msError).ToString+SQL_UPDATE_part3_Error
+              Update_SQL := Update_SQL+byte(msError).ToString+SQL_UPDATE_part2_Error
             else
-              Update_SQL := Update_SQL+byte(msRetrying).ToString+SQL_UPDATE_part3_Retry;
+              Update_SQL := Update_SQL+byte(msRetrying).ToString+SQL_UPDATE_part2_Retry;
+            ProcessingLog := ProcessingLog+#13#10+Res.ErrorMsg;
           end;
+          Update_SQL := Update_SQL+SQL_UPDATE_part3;
           var Cmd := Session.CreateCommand(Update_SQL);
-          Cmd.Parameters.SetIntegerDataBinding(0, Attempts);
-          Cmd.Parameters.SetIntegerDataBinding(1, Current_ID);
+          Cmd.Parameters.SetTextDataBinding(0, ProcessingLog);
+          Cmd.Parameters.SetIntegerDataBinding(1, Attempts);
+          Cmd.Parameters.SetIntegerDataBinding(2, Current_ID);
           Cmd.Execute;
           if Res.Success then
             TdwlMailQueue.Log('Successfully sent mail to '+Msg.Recipients.EMailAddresses, lsTrace)
           else
-            TdwlMailQueue.Log('Failed to sent mail ['+Res.ErrorMsg+'] to '+Msg.Recipients.EMailAddresses, lsTrace);
+            TdwlMailQueue.Log('Failed to sent mail to '+Msg.Recipients.EMailAddresses+' ['+TdwlStrUtils.Sanatize(Res.ErrorMsg, [soRemoveLineBreaks])+']', lsError);
         finally
           Msg.Free;
         end;
@@ -318,6 +357,11 @@ begin
         FreeSMTP;
         FSMTP := TIdSMTP.Create(nil);
         FCurrentContextParams := DomainContextParams;
+        if FCurrentContextParams=nil then
+        begin
+          Result.AddErrorMsg('No Context found for from: '+Msg.From.Address);
+          Exit;
+        end;
         // AdR 20190820: See if setting timeouts prevent the queue from
         // hanging sometimes...
         FSMTP.ConnectTimeout := 30000; {30 secs}
@@ -333,7 +377,7 @@ begin
           var AccessToken := Authorizer.GetAccesstoken;
           if AccessToken='' then
           begin
-            TdwlMailQueue.Log('Error fetching Access token for Context: '+DomainFrom);
+            Result.AddErrorMsg('Error fetching Access token for Context: '+DomainFrom);
             Exit;
           end;
           FIdSASL := TIdSASLOAuth2.Create(nil);
@@ -357,7 +401,10 @@ begin
       end;
       try
         if not FSMTP.Connected then
-          raise Exception.Create('Failed to connect to mailserver');
+        begin
+          Result.AddErrorMsg('Failed to connect to mailserver');
+          Exit;
+        end;
         FSMTP.Send(Msg);
         MailIsSent := true;
       except
@@ -376,7 +423,7 @@ begin
       Result.AddErrorMsg('For some unknown reason mail was not sent');
   except
     on E:Exception do
-      Result.AddErrorMsg('Failed delivery for "'+Msg.From.Address+'": '+E.Message);
+      Result.AddErrorMsg(E.Message);
   end;
 end;
 
@@ -389,18 +436,6 @@ begin
     FCurrentContextParams.WriteValue(Param_Refreshtoken, Token);
     // we need to add here that the mailqueue_domains is written back to params
   end;
-end;
-
-{ TIdSASLOAuth2 }
-
-class function TIdSASLOAuth2.ServiceName: TIdSASLServiceName;
-begin
-  Result := 'XOAUTH2';
-end;
-
-function TIdSASLOAuth2.StartAuthenticate(const AChallenge, AHost, AProtocolName: string): string;
-begin
-  Result := 'user=' + FUser + Chr($01) + 'auth=Bearer ' + FToken + Chr($01) + Chr($01);
 end;
 
 end.

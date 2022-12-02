@@ -133,11 +133,12 @@ implementation
 
 uses
   DWL.HTTP.Consts, System.SysUtils, DWL.JOSE, DWL.Types, DWL.Params.Consts,
-  System.Rtti, System.DateUtils, DWL.SysUtils, DWL.Logging, DWL.Logging.API,
+  System.Rtti, System.DateUtils, DWL.Logging, DWL.Logging.API,
   DWL.HTTP.Server.Utils, DWL.HTTP.Server.Globals;
 
 const
   Param_Body_JSON='body_json';
+  Param_Scopes='scopes';
 
 type
   PBaseInternalHandlingStructure = ^TBaseInternalHandlingStructure;
@@ -251,6 +252,9 @@ begin
       var BodyJSON: TJSONObject;
       if (StateParams(State).TryGetValue(Param_Body_JSON, V) and V.TryAsType(BodyJSON, false)) then
         BodyJSON.Free;
+      var Scopes: TStringList;
+      if (StateParams(State).TryGetValue(Param_Scopes, V) and V.TryAsType(Scopes, false)) then
+        Scopes.Free;
       PBaseInternalHandlingStructure(State._InternalHandlingStructure).Params := nil;
     end;
     FreeMem(State._InternalHandlingStructure);
@@ -273,8 +277,6 @@ begin
 end;
 
 class function TdwlDLLHandling.StateParams_Scopes(const State: PdwlHTTPHandlingState): TStringList;
-const
-  Param_Scopes='scopes';
 begin
   var Params := StateParams(State);
   var V: TValue;
@@ -282,7 +284,7 @@ begin
   begin
     Result := TStringList.Create;
     Result.CaseSensitive := false;
-    Params.WriteValue('scopes', TValue.From(Result));
+    Params.WriteValue(Param_Scopes, TValue.From(Result));
   end;
 end;
 
@@ -304,7 +306,7 @@ end;
 
 class function TdwlDLLHandling.TryGetPayloadPtr(const State: PdwlHTTPHandlingState; out Data: pointer; out DataSize: Int64): boolean;
 begin
-  Result := serverProcs.GetPayloadPtrProc(@State, Data, DataSize);
+  Result := serverProcs.GetPayloadPtrProc(State, Data, DataSize);
 end;
 
 class function TdwlDLLHandling.TryGetRequestParamBool(const State: PdwlHTTPHandlingState; const Key: string; var Value: boolean; AddJSONErrorOnFailure: boolean; const NewStatusCodeOnError: word): boolean;
@@ -440,8 +442,8 @@ end;
 
 class function TdwlDLLHandling.ScopeOverlap(const State: PdwlHTTPHandlingState; const Scopes: TArray<string>): boolean;
 begin
-  var StateScopes := StateParams_Scopes(State);
   Result := false;
+  var StateScopes := StateParams_Scopes(State);
   if StateScopes=nil then
     Exit;
   for var i := 0 to High(Scopes) do
@@ -479,7 +481,6 @@ begin
   Result := inherited Authorize(State);
   if Result then
     Exit;
-  Result := false;
   var AccessToken := '';
   var AuthStr: string;
   if TryGetHeaderValue(State, 'Authorization', AuthStr) then
@@ -494,35 +495,39 @@ begin
       TryGetHeaderValue(State, 'accesstoken', AccessToken)) then
       AccessToken := '';
   end;
-  if AccessToken<>'' then
-  begin
-    try
-      var JWT := New_JWT_FromSerialization(AccessToken);
-      if not FOIDC_Client.CheckJWT(JWT).Success then
-        Exit;
-      Result := (JWT.Payload.IntValues[jwtclaimEXPIRATION_TIME]>TUnixEpoch.Now) and
-        SameText(JWT.Payload.Values[jwtclaimISSUER], FOIDC_Client.Issuer_Uri);
-      // all ok store authentication information
-      var JWTScopes := JWT.Payload.Values[jwt_key_SCOPE].Split([' ']);
-      var Scopes := StateParams_Scopes(State);
-      for var Scope in  JWTScopes do
-        Scopes.Add(Scope);
-      // write userid in state var, to be deprecated at some point
-      // add logging info to state
-      var Subject := JWT.Payload.Values[jwtclaimSUBJECT];
-      StateParams(State).WriteValue(Param_Subject, Subject);
-    except
-      Result := false;
-    end;
+  if AccessToken='' then
+    Exit;
+  try
+    var JWT := New_JWT_FromSerialization(AccessToken);
+    if not FOIDC_Client.CheckJWT(JWT).Success then
+      Exit;
+    if not  (JWT.Payload.IntValues[jwtclaimEXPIRATION_TIME]>TUnixEpoch.Now) and
+      SameText(JWT.Payload.Values[jwtclaimISSUER], FOIDC_Client.Issuer_Uri) then
+      Exit;
+    // all ok store authentication information
+    var JWTScopes := JWT.Payload.Values[jwt_key_SCOPE].Split([' ']);
+    var Scopes := StateParams_Scopes(State);
+    for var Scope in  JWTScopes do
+      Scopes.Add(Scope);
+    // write userid in state var, to be deprecated at some point
+    // add logging info to state
+    var Subject := JWT.Payload.Values[jwtclaimSUBJECT];
+    StateParams(State).WriteValue(Param_Subject, Subject);
+    Result := true;
+  except
   end;
 end;
 
 class procedure TdwlDLLHandling_OpenID.Configure(const Params: string);
 begin
   inherited Configure(Params);
+  // get the Issuer,
   var Issuer := FConfigParams.StrValue(Param_Issuer);
   if Issuer='' then
-    raise Exception.Create('Issuer is not configured');
+  begin
+    Issuer :=  FConfigParams.StrValue(Param_BaseURI)+Default_EndpointURI_OAuth2;
+    TdwlLogger.Log('No issuer configured, default applied: '+Issuer, lsNotice);
+  end;
   // we only need this client for JWT checking purposes
   FOIDC_Client := TdwlOIDC_Client.Create(Issuer, '', '');
 end;

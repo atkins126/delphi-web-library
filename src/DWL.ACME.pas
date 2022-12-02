@@ -161,7 +161,7 @@ uses
   IdCoderMIME, System.Classes, System.AnsiStrings, System.StrUtils,
   System.DateUtils, System.IOUtils, System.Math, System.JSON, Winapi.WinInet,
   IdHTTPServer, System.Hash, Winapi.Windows,
-  System.Generics.Collections, DWL.SysUtils, System.NetEncoding,
+  System.Generics.Collections, System.NetEncoding,
   IdAssignedNumbers;
 
 const
@@ -523,7 +523,7 @@ begin
           begin
             ChallToken := Challenges.Items[ChallNo].GetValue<string>('token');
             ChallUrl := Challenges.Items[ChallNo].GetValue<string>('url');
-            Log('Starting HTTP challenge '+(ChallNo+1).Tostring, lsTrace);
+            Log('Starting HTTP challenge '+(ChallNo+1).Tostring+ ' (listening on port '+CallBackPortNumber.ToString+')', lsTrace);
             Status := '';
             FHTTPRequestSeen := false;
             HTTPServer := TIdHTTPServer.Create(nil);
@@ -534,7 +534,11 @@ begin
               HTTPServer.OnCommandGet := HTTPServerCommand;
               HTTPServer.DefaultPort := CallBackPortNumber;
               if ChallengeIP<>'' then
-                HTTPServer.Bindings.Add.IP := ChallengeIP;
+              begin
+                var Bind := HTTPServer.Bindings.Add;
+                Bind.IP := ChallengeIP;
+                Bind.Port := IdPORT_HTTP;
+              end;
               HTTPServer.Active := true;
               // start the challenge
               TickCount := GetTickCount64;
