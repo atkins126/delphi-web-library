@@ -23,12 +23,12 @@ type
       FConfigParams: IdwlParams;
       FVersionParams: IdwlParams;
       FTempUpdateDir: string;
-      F7ZWasChecked: boolean;
     class procedure EmptyTempUpdateDir;
     class procedure Init_Params;
     class function VersionParams: IdwlParams;
     class function TempUpdateDir: string;
     class procedure ProgressMsg(const Msg: string; ProcessingFinished: boolean=false);
+    class function CheckDLL(const PackageName, FileVersion: string): boolean;
   protected
     class var
       FProgressBytesFunc: TdwlHTTPProgressEvent;
@@ -38,8 +38,12 @@ type
     class function AppName: string;
     class function CheckApplicationUpdate(ForceUpdate: boolean=false): boolean;
     class function CheckPreReleaseUpdate: TdwlResult;
+    class function CheckPackageUpdate(const PackageName: string; const DestinationDir: string=''): boolean;
     class function ConfigParams: IdwlParams;
-    class procedure CheckDLL_7Z;
+    class function CheckDLL_7Z: boolean;
+    class function CheckDLL_MySQL: boolean;
+    class function CheckDLL_OpenSSL3: boolean;
+    class function CheckDLL_WebView2: boolean;
     class function GetReleaseInDir(const PackageName, DestinationDir: string; RequestPrerelease: boolean=false): boolean;
   end;
 
@@ -49,7 +53,7 @@ uses
   DWL.HTTP.Consts, DWL.IOUtils, System.SysUtils, System.JSON, System.IOUtils,
   Winapi.WinInet, System.Classes, DWL.Compression, DWL.DisCo.Consts,
   System.Math, DWL.OS, sevenzip, DWL.Params.Utils, DWL.Params.Consts,
-  System.StrUtils, DWL.StrUtils;
+  System.StrUtils, DWL.StrUtils, System.NetEncoding;
 
 
 { TdwlDisCo }
@@ -107,19 +111,71 @@ begin
   Result := true;
 end;
 
-class procedure TdwlDiscoClient.CheckDLL_7Z;
-const
-  Version7z = '18.5';
+class function TdwlDiscoClient.CheckDLL(const PackageName, FileVersion: string): boolean;
 begin
-  if F7ZWasChecked then
-    Exit;
-  // let the JCL know which dll we want to use...
   var ExeDir := ExtractFileDir(ParamStr(0));
-  var ZipDllFn := ExeDir+'\'+SevenZipLibraryName;
-  if not (FileExists(ZipDllFn) and
-    (TdwlFileVersionInfo.CreateFromFile(ZipDllFn)>=TdwlFileVersionInfo.CreateFromString(Version7Z))) then
-    GetReleaseInDir(TdwlFile.ExtractBareName(ZipDllFn), ExeDir);
-  F7ZWasChecked := true;
+  var Fn := ExeDir+'\'+PackageName+'.dll';
+  Result := FileExists(Fn) and (TdwlFileVersionInfo.CreateFromFile(Fn)>=TdwlFileVersionInfo.CreateFromString(FileVersion));
+  if not Result then
+    Result := GetReleaseInDir(PackageName, ExeDir);
+end;
+
+class function TdwlDiscoClient.CheckDLL_7Z: boolean;
+begin
+  {$IFDEF WIN64}
+  Result := CheckDLL('7z64', '18.5.0');
+  {$ELSE}
+  Result := CheckDLL('7z', '18.5.0');
+  {$ENDIF}
+end;
+
+class function TdwlDiscoClient.CheckDLL_MySQL: boolean;
+begin
+  {$IFDEF WIN64}
+  Result := CheckDLL('libmysql64', '5.6.24');
+  {$ELSE}
+  Result := CheckDLL('libmysql', '5.6.24');
+  {$ENDIF}
+end;
+
+class function TdwlDiscoClient.CheckDLL_OpenSSL3: boolean;
+begin
+  {$IFDEF WIN64}
+  Result := CheckDLL('libcrypto-3-x64', '3.0.0');
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
+end;
+
+class function TdwlDiscoClient.CheckDLL_WebView2: boolean;
+begin
+  {$IFDEF WIN64}
+  Result := CheckDLL('WebView2Loader', '1.0.664');
+  {$ELSE}
+  Result := false;
+  {$ENDIF}
+end;
+
+class function TdwlDiscoClient.CheckPackageUpdate(const PackageName: string; const DestinationDir: string=''): boolean;
+begin
+  Result := false;
+  var DestDir := DestinationDir;
+  if DestDir='' then
+    DestDir := ExtractFilePath(ParamStr(0))+PackageName;
+  var FnVersion := DestDir+'\version.info';
+  var CurrentIsOk := FileExists(FnVersion);
+  if CurrentIsOk then // check current version
+  begin
+    var CurrentVersion := TdwlFileVersionInfo.CreateFromString(TFile.ReadAllText(FnVersion));
+    var ConfigVersion := TdwlFileVersionInfo.CreateFromString(TdwlDiscoClient.VersionParams.StrValue(PackageName));
+    CurrentIsOk := ConfigVersion.IsEmpty or CurrentVersion.IsEmpty or (CurrentVersion>=ConfigVersion);
+  end;
+  if CurrentIsOk then
+    Exit;
+  if DirectoryExists(DestDir) then
+    TDirectory.Delete(DestDir, true);
+  GetReleaseInDir(PackageName, DestDir);
+  Result := true;
 end;
 
 class function TdwlDiscoClient.CheckPreReleaseUpdate: TdwlResult;
@@ -196,7 +252,7 @@ begin
   try
     ProgressMsg('Downloading '+PackageName);
     try
-      var Response := FApiSession.ExecuteApiRequest('download/package', HTTP_COMMAND_GET, 'packagename='+PackageName+'&kind='+
+      var Response := FApiSession.ExecuteApiRequest('download/package', HTTP_COMMAND_GET, 'packagename='+TNetEncoding.URL.Encode(PackageName)+'&kind='+
         IfThen(RequestPrerelease, discoreleasekindPreRelease, discoreleasekindRelease).ToString, true, false, FProgressBytesFunc);
       if (Response=nil) or (Response.StatusCode<>HTTP_STATUS_OK) then
         Exit;
@@ -211,6 +267,7 @@ begin
       end;
       if FileName='' then
         Exit;
+      ForceDirectories(DestinationDir);
       if SameText(ExtractFileExt(FileName), '.7z') then
       begin
         CheckDLL_7Z;
@@ -218,6 +275,10 @@ begin
         TFile.WriteAllBytes(ZipFn, Response.AsBytes);
         if not TdwlCompression.ExtractArchive(ZipFn, DestinationDir).Success then
           Exit;
+        try
+          TFile.Delete(ZipFn);
+        except
+        end;
       end
       else
         TFile.WriteAllBytes(DestinationDir+'\'+FileName, Response.AsBytes);
@@ -235,43 +296,74 @@ begin
   FConfigParams := New_Params;
   FVersionParams := New_Params;
   var CommandLineParams := New_Params;
-  TdwlParamsUtils.Import_CommandLine(CommandLineParams);
+  try
+    TdwlParamsUtils.Import_CommandLine(CommandLineParams);
+  except
+  end;
   var Profile := CommandLineParams.StrValue(Param_Profile);
   {$IFDEF DEBUG}
   if Profile='' then
     Profile := 'localhost';
   {$ENDIF}
-  // seen the naming convention 'Path' you would expect a trailing backslash, but it comes withou
-  // create a safe workaround for this:
-  var CacheFn := TPath.GetPublicPath.TrimRight(['\'])+'\DisCo\PhoneHome';
-  ForceDirectories(CacheFn);
-  CacheFn := CacheFn+'\'+AppName+IfThen(Profile<>'', '_'+Profile)+'.json';
-  var Response := FApiSession.ExecuteJSONRequest('phonehome', HTTP_COMMAND_GET, 'appname='+AppName.ToLower+IfThen(Profile<>'', '&profile='+Profile));
-  var Data: TJSONObject;
-  if Response.Success then
+  var Response: IdwlAPIResponse := nil;
+  try
+    Response := FApiSession.ExecuteJSONRequest('phonehome', HTTP_COMMAND_GET, 'appname='+AppName.ToLower+IfThen(Profile<>'', '&profile='+Profile));
+  except
+    Response := nil;
+  end;
+  var Data: TJSONObject := nil;
+  var FreeData := false;
+  var CacheFn: string;
+  try
+    // seen the naming convention 'Path' you would expect a trailing backslash, but it comes without
+    // create a safe workaround for this:
+    CacheFn := TPath.GetCachePath.TrimRight(['\'])+'\DWL\DisCo\PhoneHome';
+    ForceDirectories(CacheFn);
+    CacheFn := CacheFn+'\'+AppName+IfThen(Profile<>'', '_'+Profile)+'.json';
+  except
+    CacheFn := '';
+  end;
+  if (Response<>nil) and Response.Success then
   begin
     Data := Response.Data;
-    TFile.WriteAllText(CacheFn, Data.ToJSON);
+    try
+      if CacheFn<>'' then
+        TFile.WriteAllText(CacheFn, Data.ToJSON);
+    except
+      // Writing to cache never can lead to stopping the flow, resulting in a not updating application
+    end;
   end
   else
   begin
-    if FileExists(CacheFn) then
-      Data := TJSONObject(TJSONValue.ParseJSONValue(TFile.ReadAllText(CacheFn)))
-    else
-     Data := nil;
+    try
+      if FileExists(CacheFn) then
+      begin
+        FreeData := true;
+        Data := TJSONObject(TJSONValue.ParseJSONValue(TFile.ReadAllText(CacheFn)));
+      end
+    except
+    end;
   end;
   if Data<>nil then
   begin
-    var ParseData := Data.GetValue<TJSONObject>('parameters');
-    if ParseData<>nil then
-      FConfigParams.WriteJSON(ParseData);
-    ParseData := Data.GetValue<TJSONObject>('versions');
-    if ParseData<>nil then
-      FVersionParams.WriteJSON(ParseData);
+    try
+      var ParseData := Data.GetValue<TJSONObject>('parameters');
+      if ParseData<>nil then
+        FConfigParams.WriteJSON(ParseData);
+      ParseData := Data.GetValue<TJSONObject>('versions');
+      if ParseData<>nil then
+        FVersionParams.WriteJSON(ParseData);
+    finally
+      if FreeData then
+        Data.Free;
+    end;
   end;
   // Now add commandline params to configparams
   // Doing this at the end give the commandline the highest priority
-  CommandLineParams.AssignTo(FConfigParams);
+  try
+    CommandLineParams.AssignTo(FConfigParams);
+  except
+  end;
 end;
 
 class procedure TdwlDiscoClient.ProgressMsg(const Msg: string; ProcessingFinished: boolean=false);

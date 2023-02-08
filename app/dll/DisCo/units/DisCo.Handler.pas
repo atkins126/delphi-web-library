@@ -67,7 +67,9 @@ const
 
   procedure AddOrOverwritePair(JSON: TJSONObject; const Str, Val: string);
   begin
-    JSON.RemovePair(Str);
+    var Pair := JSON.RemovePair(Str);
+    if Pair<>nil then
+      Pair.Free;
     JSON.AddPair(Str, Val);
   end;
 begin
@@ -129,7 +131,7 @@ begin
   Cmd.Parameters.SetTextDataBinding(0, AppName);
   Cmd.Execute;
   while Cmd.Reader.Read do
-    JSONVersions.AddPair(AppName, Cmd.Reader.GetString(0));
+    JSONVersions.AddPair(Cmd.Reader.GetString(0), Cmd.Reader.GetString(1));
   JSON_Set_Success(State);
 end;
 

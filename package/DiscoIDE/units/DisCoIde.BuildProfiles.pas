@@ -17,7 +17,8 @@ type
     class procedure DoBuildPreRelease(Sender: TObject);
     class procedure DoBuildRelease(Sender: TObject);
     class function GetSuitableproject: IOTAProject;
-    class procedure OutputVersionInfo(Project: IOTAProject; IsARelease, IsAPreRelease: boolean);
+    class procedure OutputVersionInfo(Project: IOTAProject; IsADebug, IsAPreRelease, IsARelease: boolean);
+    class procedure SetDefines(Project: IOTAProject; IsRelease: boolean);
   public
     class constructor Create;
     class destructor Destroy;
@@ -85,7 +86,8 @@ begin
     TdwlToolsAPI.SetProjectOption(Project, 'StackFrames', 0);
     TdwlToolsAPI.SetProjectOption(Project, 'DebugInfo', true);
     TdwlToolsAPI.SetProjectOption(Project, 'MapFile', 0);
-    OutputVersionInfo(Project, false, false);
+    SetDefines(Project, false);
+    OutputVersionInfo(Project, true, false, false);
     Project.ProjectBuilder.BuildProject(cmOTABuild, true);
   except
     on E: Exception do
@@ -112,7 +114,8 @@ begin
     TdwlToolsAPI.SetProjectOption(Project, 'StackFrames', 0);
     TdwlToolsAPI.SetProjectOption(Project, 'DebugInfo', false);
     TdwlToolsAPI.SetProjectOption(Project, 'MapFile', 3);
-    OutputVersionInfo(Project, false, true);
+    SetDefines(Project, true);
+    OutputVersionInfo(Project, false, true, false);
     Project.ProjectBuilder.BuildProject(cmOTABuild, true);
   except
     on E: Exception do
@@ -139,7 +142,8 @@ begin
     TdwlToolsAPI.SetProjectOption(Project, 'StackFrames', 0);
     TdwlToolsAPI.SetProjectOption(Project, 'DebugInfo', false);
     TdwlToolsAPI.SetProjectOption(Project, 'MapFile', 3);
-    OutputVersionInfo(Project, true, false);
+    SetDefines(Project, true);
+    OutputVersionInfo(Project, false, false, true);
     Project.ProjectBuilder.BuildProject(cmOTABuild, true);
   except
     on E: Exception do
@@ -157,7 +161,7 @@ begin
     Result := nil;
 end;
 
-class procedure TDisCoIde_BuildProfiles.OutputVersionInfo(Project: IOTAProject; IsARelease, IsAPreRelease: boolean);
+class procedure TDisCoIde_BuildProfiles.OutputVersionInfo(Project: IOTAProject; IsADebug, IsAPreRelease, IsARelease: boolean);
 begin
   var VersionInfo: TdwlFileVersionInfo;
   var Fn_ProjPar := ChangeFileExt(Project.FileName, '.params');
@@ -179,6 +183,7 @@ begin
   finally
     ProjPar.Free;
   end;
+  // Increase version number
   if IsARelease then
   begin
     if VersionInfo.Release=9 then
@@ -195,39 +200,27 @@ begin
     else
       inc(VersionInfo.Release);
   end;
-  // always increase build number
-  inc(VersionInfo.Build);
-  // write versioninfo.rc for inclusion as a resource in project
-  var Resource := TStringList.Create;
-  try
-    Resource.Add('1 VERSIONINFO');
-    Resource.Add('FILEVERSION ' + VersionInfo.GetAsString(true, false, ',' ));
-    Resource.Add('PRODUCTVERSION ' + VersionInfo.GetAsString(true, false, ',' ));
-    if IsAPreRelease then
+  inc(VersionInfo.Build); // always increase build number
+  // set versioninfo in project
+  var ProjectOptions := Project.ProjectOptions as IOTAProjectOptionsConfigurations;
+  if Assigned(ProjectOptions) then
+  begin
+    var cfg := ProjectOptions.ActiveConfiguration;
+    if Assigned(cfg) then
     begin
-      Resource.Add('FILEFLAGSMASK VS_FFI_FILEFLAGSMASK');
-      Resource.Add('FILEFLAGS VS_FF_PRERELEASE');
+      cfg.SetBoolean('VerInfo_IncludeVerInfo', true);
+      cfg.SetInteger('VerInfo_MajorVer', VersionInfo.Major);
+      cfg.SetInteger('VerInfo_MinorVer', VersionInfo.Minor);
+      cfg.SetInteger('VerInfo_Release', VersionInfo.Release);
+      cfg.SetInteger('VerInfo_Build', VersionInfo.Build);
+      cfg.SetValue('VerInfo_Keys', 'CompanyName=;FileDescription=$(MSBuildProjectName);FileVersion='+
+        VersionInfo.GetAsString(true)+';InternalName=;LegalCopyright=;LegalTrademarks=;OriginalFilename=;ProgramID=com.embarcadero.$(MSBuildProjectName);ProductName=$(MSBuildProjectName);ProductVersion='+
+        VersionInfo.GetAsString(true)+';Comments=');
+      cfg.SetBoolean('VerInfo_AutoGenVersion', false);
+      cfg.SetBOolean('VerInfo_AutoIncVersion', false);
+      cfg.SetBoolean('VerInfo_Debug', IsADebug);
+      cfg.SetBoolean('VerInfo_PreRelease', IsAPreRelease);
     end;
-    if Project.CurrentPlatform <> 'Win64' then
-      Resource.Add('FILEOS VOS__WINDOWS32');
-    Resource.Add('FILETYPE VFT_APP');
-    Resource.Add('BEGIN');
-    Resource.Add('BLOCK "StringFileInfo"');
-    Resource.Add('BEGIN');
-    Resource.Add('BLOCK "040904E4"');
-    Resource.Add('BEGIN');
-    Resource.Add('VALUE "FileVersion", "' + VersionInfo.GetAsString(true) + '\000"');
-    Resource.Add('VALUE "ProductVersion", "' + VersionInfo.GetAsString(true) + '\000"');
-    Resource.Add('END');
-    Resource.Add('END');
-    Resource.Add('BLOCK "VarFileInfo"');
-    Resource.Add('BEGIN');
-    Resource.Add('VALUE "Translation", 0x0409 0x04E4');
-    Resource.Add('END');
-    Resource.Add('END');
-    Resource.SaveToFile(Path_Proj + 'versioninfo.rc');
-  finally
-    Resource.Free;
   end;
   // write versioninfo.inc for usage where needed in pascal source
   System.IOUtils.TFile.WriteAllText(Path_Proj + 'versioninfo.inc',
@@ -239,6 +232,28 @@ begin
     (TTimeZone.Local.ToUniversalTime(Now)) + ';'#13#10 + '  ' +
     paramVersion_Is_Prerelease + ' = ' + IfThen(IsAPreRelease, 'true',
     'false') + ';');
+end;
+
+class procedure TDisCoIde_BuildProfiles.SetDefines(Project: IOTAProject; IsRelease: boolean);
+begin
+  var Defines := TStringList.Create;
+  try
+    Defines.Delimiter := ';';
+    Defines.DelimitedText := Project.ProjectOptions.Values['Defines'];
+    var i := Defines.IndexOf('DEBUG');
+    if (i<0) and (not IsRelease) then
+      Defines.Add('DEBUG');
+    if (i>=0) and IsRelease then
+      Defines.Delete(i);
+    i := Defines.IndexOf('RELEASE');
+    if (i<0) and IsRelease then
+      Defines.Add('RELEASE' );
+    if (i>=0) and not IsRelease then
+      Defines.Delete(i);
+    Project.ProjectOptions.Values['Defines'] := Defines.DelimitedText;
+  finally
+    Defines.Free;
+  end;
 end;
 
 end.

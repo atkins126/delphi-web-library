@@ -45,7 +45,7 @@ uses
 class function TdwlFile.ExtractBareName(const Path: string=''): string;
 begin
   if Path='' then
-    Result := ChangeFileExt(ExtractFileName(ParamStr(0)),'')
+    Result := ChangeFileExt(ExtractFileName(GetModuleName(HInstance)),'')
   else
     Result := ChangeFileExt(ExtractFileName(Path),'');
 end;
@@ -205,7 +205,8 @@ end;
 procedure TdwlFileVersionInfo.SetFromString(const VersionString: string; Separator: char='.');
 begin
   Clear;
-  if VersionString='' then Exit;
+  if VersionString='' then
+    Exit;
   var VersionStr := VersionString;
   var P := Pos(Separator, VersionStr);
   if P<2 then

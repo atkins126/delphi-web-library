@@ -13,14 +13,6 @@ uses
   DWL.HTTP.Server.Types, System.Generics.Collections, IdHTTPServer,
   IdSocketHandle;
 
-const
-  httpLogLevelEmergency = 0;
-  httplogLevelFailedRequests=3;
-  httplogLevelWarning=4;
-  httplogLevelAllRequests=6;
-  httplogLevelDebug=6;
-  httplogLevelEverything=9;
-
 type
   TdwlHTTPServer=class;
   TdwlHTTPHandler=class;
@@ -39,6 +31,7 @@ type
   /// </summary>
   TdwlHTTPServer = class
   strict private
+    FOnlyLocalConnections: boolean;
     FRequestsInProgress: TDictionary<TIdContext, PdwlHTTPHandlingState>;
     FRequestsInProgressAccess: TCriticalSection;
     FRootHandlerAccess: TMultiReadExclusiveWriteSynchronizer;
@@ -73,6 +66,7 @@ type
     ///   consts for details about the levels
     /// </summary>
     property LogLevel: byte read FLogLevel write FLogLevel;
+    property OnlyLocalConnections: boolean read FOnlyLocalConnections write FOnlyLocalConnections;
     constructor Create;
     destructor Destroy; override;
     function BaseURI: string;
@@ -326,9 +320,10 @@ end;
 
 function TdwlHTTPServer.BaseURI: string;
 begin
+  // The base uri is ALWAYS the standard port!!
+  // Listenport is not taken into account
   Result := IfThen(IsSecure, 'https', 'http')+'://'+
-    IfThen(FSSL_HostName='', 'localhost', FSSL_HostName)+
-    IfThen((Bindings.Count>0) and ((IsSecure and (Bindings[0].Port<>IdPORT_https)) or ((not IsSecure) and (Bindings[0].Port<>IdPORT_HTTP))), ':'+Bindings[0].Port.ToString);
+    IfThen(FSSL_HostName='', 'localhost', FSSL_HostName);
 end;
 
 procedure TdwlHTTPServer.ClearURIAliases;
@@ -382,11 +377,11 @@ end;
 
 function TdwlHTTPServer.FindHandler(const URI: string): TdwlHTTPHandler;
 begin
-  FRootHandlerAccess.BeginWrite;
+  FRootHandlerAccess.BeginRead;
   try
     Result := TdwlHTTPHandler_PassThrough(FRootHandler).FindHandler(URI);
   finally
-    FRootHandlerAccess.EndWrite;
+    FRootHandlerAccess.EndRead;
   end;
 end;
 
@@ -585,6 +580,14 @@ end;
 
 procedure TdwlHTTPServer.HTTPServerCommand(AContext: TIdContext; ARequestInfo: TIdHTTPRequestInfo; AResponseInfo: TIdHTTPResponseInfo);
 begin
+  if OnlyLocalConnections then
+  begin
+    if (AContext.Binding.PeerIP<>'127.0.0.1') then
+    begin
+      AResponseInfo.ResponseNo := HTTP_STATUS_FORBIDDEN;
+      Exit;
+    end;
+  end;
   var State: PdwlHTTPHandlingState := AllocMem(SizeOf(TdwlHTTPHandlingState));
   FRequestsInProgressAccess.Enter;
   try
@@ -770,8 +773,11 @@ begin
     end
     else
     begin
-      State.StatusCode := HTTP_STATUS_DENIED;
-      State.SetContentText('<html>Not authorized.</html>');
+      // We issue a not found (instead of a denied), because this doesn't reveal unneeded information
+      // and if the url is temporary not available, giving a 401 will result in logging out
+      // in some clients which we want to prevent
+      State.StatusCode := HTTP_STATUS_NOT_FOUND;
+      State.SetContentText('<html>Not found.</html>');
       Result := true;
     end;
   end;

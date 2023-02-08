@@ -43,9 +43,9 @@ uses
 
 const
   SQL_CheckTable_Handlers =
-    'CREATE TABLE IF NOT EXISTS dwl_handlers (id int AUTO_INCREMENT, endpoint varchar(50), handler_uri varchar(255), `params` TEXT NULL, INDEX `primaryindex` (`id`))';
+    'CREATE TABLE IF NOT EXISTS dwl_handlers (id INT AUTO_INCREMENT, open_order SMALLINT, endpoint VARCHAR(50), handler_uri VARCHAR(255), `params` TEXT NULL, INDEX `primaryindex` (`id`))';
   SQL_CheckTable_UriAliases =
-    'CREATE TABLE IF NOT EXISTS dwl_urialiases (id int AUTO_INCREMENT, alias varchar(255), uri varchar(255), PRIMARY KEY (id))';
+    'CREATE TABLE IF NOT EXISTS dwl_urialiases (id INT AUTO_INCREMENT, alias VARCHAR(255), uri VARCHAR(255), PRIMARY KEY (id))';
   SQL_Get_UriAliases =
     'SELECT alias, uri FROM dwl_urialiases';
 
@@ -123,7 +123,7 @@ begin
     InitDatabase;
     FLogHandler := TdwlHTTPHandler_Log.Create(FParams); // init before activating DoLog!
     TdwlMailQueue.Configure(FParams, true);
-    EnableLogDispatchingToCallback(false, DoLog);
+    var CallBackLogDispatcher := EnableLogDispatchingToCallback(false, DoLog);
     ACMECLient := TdwlACMEClient.Create;
     try
       ACMECLient.Domain := FParams.StrValue(Param_ACMEDomain);
@@ -133,12 +133,14 @@ begin
       ACMEClient.CallBackPortNumber := FParams.IntValue(Param_ACMEPort, ParamDef_ACMEPort);
       HTTPServer := TdwlHTTPServer.Create;
       try
-        var IP := FParams.StrValue(Param_Binding_IP);
-        if IP<>'' then
+        var IP: string;
+        if FParams.TryGetStrValue(Param_Binding_IP, IP) then
         begin
           TdwlLogger.Log('Bound to specific IP '+IP, lsTrace);
           ACMECLient.ChallengeIP := IP;
-        end;
+        end
+        else
+          IP := '';
         CheckACME;
         var Port: integer;
         if not FParams.TryGetIntValue(Param_Binding_Port, Port) then
@@ -156,14 +158,20 @@ begin
         LoadURIAliases(HTTPServer);
         HTTPServer.Open;
         HTTPServer.RegisterHandler(EndpointURI_Log,  FLogHandler);
-        HTTPServer.RegisterHandler(EndpointURI_Mail,  TdwlHTTPHandler_Mail.Create(FParams));
         HTTPServer.LogLevel := FParams.IntValue(Param_LogLevel, httplogLevelWarning);
         TdwlLogger.Log('Enabled Request logging (level '+HTTPServer.LogLevel.ToString+')', lsTrace);
+        HTTPServer.RegisterHandler(EndpointURI_Mail,  TdwlHTTPHandler_Mail.Create(FParams));
         if not HTTPServer.IsSecure then
-          TdwlLogger.Log('SERVER IS NOT SECURE, please configure or review ACME parameters', lsWarning);
+        begin
+          HTTPServer.OnlyLocalConnections := FParams.BoolValue(Param_TestMode);
+          if HTTPServer.OnlyLocalConnections then
+            TdwlLogger.Log('SERVER IS NOT SECURE, only allowing local connections', lsWarning)
+          else
+            TdwlLogger.Log('SERVER IS NOT SECURE, please configure or review ACME parameters', lsWarning);
+        end;
         TdwlLogger.Log('Opened HTTP Server', lsNotice);
         FDLLBasePath := FParams.StrValue('DLLBasePath', ExtractFileDir(ParamStr(0)));
-        if {$IFDEF DEBUG}true{$ELSE}HTTPServer.IsSecure{$ENDIF} then
+        if HTTPServer.IsSecure or HTTPServer.OnlyLocalConnections then
           LoadDLLHandlers(HTTPServer)
         else
           TdwlLogger.Log('Skipped loading of handlers because server is not secure', lsWarning);
@@ -186,6 +194,7 @@ begin
         HTTPServer.Free;
       end;
     finally
+      TdwlLogger.UnregisterDispatcher(CallBackLogDispatcher);
       ACMECLient.Free;
     end;
   except
@@ -213,7 +222,7 @@ end;
 procedure TdwlServerCore.LoadDLLHandlers(HTTPServer: TdwlHTTPServer);
 const
   SQL_Get_Resthandlers =
-    'SELECT endpoint, handler_uri, params FROM dwl_handlers';
+    'SELECT endpoint, handler_uri, params FROM dwl_handlers ORDER BY open_order';
 var
   DLLHandle: HModule;
   ProcessProc: TDLL_ProcessRequestProc;
@@ -225,7 +234,6 @@ var
   EndPoint: string;
   L: integer;
   Handler: TdwlHTTPHandler_DLL;
-  CreatedHandlers: TList<TdwlHTTPHandler_DLL>;
 begin
   FParams.WriteValue(Param_BaseURI, HTTPServer.BaseURI);
   var Issuer := FParams.StrValue(Param_Issuer);
@@ -238,70 +246,59 @@ begin
   try
     Cmd := New_MySQLSession(FMySQL_Profile).CreateCommand(SQL_Get_Resthandlers);
     Cmd.Execute;
-    CreatedHandlers := TList<TdwlHTTPHandler_DLL>.Create;
-    try
-      while Cmd.Reader.Read do
-      begin
+    while Cmd.Reader.Read do
+    begin
+      try
+        EndPoint := Cmd.Reader.GetString(0);
+        URI := Cmd.Reader.GetString(1);
+        HandlerParams := New_Params;
+        FParams.AssignTo(HandlerParams);
+        HandlerParams.WriteNameValueText(Cmd.Reader.GetString(2 ,true));
+        if not HandlerParams.BoolValue(Param_Enabled, true) then
+          Continue;
+        HandlerParams.WriteValue(Param_Endpoint, Endpoint);
         try
-          EndPoint := Cmd.Reader.GetString(0);
-          URI := Cmd.Reader.GetString(1);
-          HandlerParams := New_Params;
-          FParams.AssignTo(HandlerParams);
-          HandlerParams.WriteNameValueText(Cmd.Reader.GetString(2 ,true));
-          if not HandlerParams.BoolValue(Param_Enabled, true) then
+          if HTTPServer.UnRegisterHandler(EndPoint) then
+            TdwlLogger.Log('Unregistered DLL Handler at endpoint '+Endpoint, lsTrace);
+          if SameText(Copy(URI, 1, 17), 'file://localhost/') then
+            FileName := FDLLBasePath+ReplaceStr(Copy(URI, 17, MaxInt), '/', '\')
+          else
+          begin
+            L := MAX_PATH;
+            SetLength(FileName, L);
+            if PathCreateFromUrl(PChar(URI), PChar(FileName), @L, 0)<>S_OK then
+              raise Exception.Create('Invalid URI');
+            SetLength(FileName, L);
+          end;
+          if not FileExists(FileName) then
+          begin
+            TdwlLogger.Log('Missing DLL '+URI+' ('+FileName+') for endpoint '+Endpoint, lsError);
             Continue;
-          HandlerParams.WriteValue(Param_Endpoint, Endpoint);
-          HTTPServer.SuspendHandling;
-          try
-            try
-              if HTTPServer.UnRegisterHandler(EndPoint) then
-                TdwlLogger.Log('Unregistered DLL Handler at endpoint '+Endpoint, lsTrace);
-              if SameText(Copy(URI, 1, 17), 'file://localhost/') then
-                FileName := FDLLBasePath+ReplaceStr(Copy(URI, 17, MaxInt), '/', '\')
-              else
-              begin
-                L := MAX_PATH;
-                SetLength(FileName, L);
-                if PathCreateFromUrl(PChar(URI), PChar(FileName), @L, 0)<>S_OK then
-                  raise Exception.Create('Invalid URI');
-                SetLength(FileName, L);
-              end;
-              if not FileExists(FileName) then
-              begin
-                TdwlLogger.Log('Missing DLL '+URI+' ('+FileName+') for endpoint '+Endpoint, lsError);
-                Continue;
-              end;
-              DLLHandle := LoadLibrary(PChar(FileName));
-              if DLLHandle=0 then
-                raise Exception.Create('LoadLibrary failed');
-              ProcessProc := GetProcAddress(DLLHandle, 'ProcessRequest');
-              AuthorizeProc := GetProcAddress(DLLHandle, 'Authorize');
-              if Assigned(ProcessProc) and Assigned(AuthorizeProc) then
-              begin
-                Handler := TdwlHTTPHandler_DLL.Create(DLLHandle, ProcessProc, AuthorizeProc, EndPoint, HandlerParams);
-                HTTPServer.RegisterHandler(EndPoint, Handler);
-                CreatedHandlers.Add(Handler);
-                TdwlLogger.Log('Registered DLL Handler '+ExtractFileName(FileName)+' at endpoint '+Endpoint, lsTrace);
-              end
-              else
-              begin
-                FreeLibrary(DLLHandle);
-                raise Exception.Create('No ProcessRequest or Authorize function found.');
-              end;
-            except
-              on E: Exception do
-                TdwlLogger.Log('Failed loading DLL '+URI+'('+FileName+') on endpoint '+Endpoint+': '+E.Message, lsError);
-            end;
-          finally
-            HTTPServer.ResumeHandling;
+          end;
+          DLLHandle := LoadLibrary(PChar(FileName));
+          if DLLHandle=0 then
+            raise Exception.Create('LoadLibrary failed');
+          ProcessProc := GetProcAddress(DLLHandle, 'ProcessRequest');
+          AuthorizeProc := GetProcAddress(DLLHandle, 'Authorize');
+          if Assigned(ProcessProc) and Assigned(AuthorizeProc) then
+          begin
+            Handler := TdwlHTTPHandler_DLL.Create(DLLHandle, ProcessProc, AuthorizeProc, EndPoint, HandlerParams);
+            HTTPServer.RegisterHandler(EndPoint, Handler);
+            TdwlLogger.Log('Registered DLL Handler '+ExtractFileName(FileName)+' at endpoint '+Endpoint, lsTrace);
+          end
+          else
+          begin
+            FreeLibrary(DLLHandle);
+            raise Exception.Create('No ProcessRequest or Authorize function found.');
           end;
         except
           on E: Exception do
-            TdwlLogger.Log('Error loading DLL handler at '+EndPoint+': '+E.Message, lsError);
+            TdwlLogger.Log('Failed loading DLL '+URI+'('+FileName+') on endpoint '+Endpoint+': '+E.Message, lsError);
         end;
+      except
+        on E: Exception do
+          TdwlLogger.Log('Error loading DLL handler at '+EndPoint+': '+E.Message, lsError);
       end;
-    finally
-      CreatedHandlers.Free;
     end;
   except
     on E: Exception do
