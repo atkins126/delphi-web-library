@@ -2,13 +2,9 @@
 ///   THESE STRUCTURES ARE SHARED BETWEEN SERVER AND DLL's <br />YOU CANNOT
 ///   CHANGE THESE UNLESS YOU RECOMPILE THE SERVER AND ALL DLL's <br /><br />
 /// </summary>
-unit DWL.HTTP.Server.Types;
+unit DWL.Server.Types;
 
 interface
-
-const
-  // the flags we're using
-  HTTP_FLAG_NOLOGGING = 1;  // do not log this request on server level
 
 type
   PdwlHTTPHandlingState = ^TdwlHTTPHandlingState;
@@ -46,12 +42,12 @@ type
     /// </summary>
     URI: PWideChar;
     /// <summary>
-    ///   The HTTP Request Command, provided from server side, do not change <br />
+    ///   The HTTP Request method, provided from server side, do not change <br />
     ///   This is a byte, definition of values can be found int DWL.HTTP.Consts f.e. 'GET'=dwlhttpGET=1
     /// </summary>
-    Command: byte;
+    RequestMethod: byte;
     /// <summary>
-    ///   bi directional flags, for now only suppress logging <br />
+    ///   bi directional flags, not used by now <br />
     /// </summary>
     Flags: integer;
     /// <summary>

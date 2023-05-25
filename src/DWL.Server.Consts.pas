@@ -1,4 +1,4 @@
-unit DWLServer.Consts;
+unit DWL.Server.Consts;
 
 interface
 
@@ -10,13 +10,24 @@ const
   Param_ACMECountry = 'ACMECountry';
   Param_ACMEState = 'ACMEState';
   Param_ACMECity = 'ACMECity';
+  Param_ACME_Account_Key = 'acme_account_key';
   Param_Binding_IP = 'binding_ip';
   Param_Binding_Port = 'binding_port';
   Param_DLLBasePath = 'dllbasepath';
   Param_TestMode = 'testmode';
+  Param_Hostnames = 'hostnames';
+  Param_Issuer = 'issuer';
+  Param_Endpoint= 'endpoint';
+  Param_LogSecret = 'logsecret';
 
-  Param_FeedConfigProc = 'feedconfigproc';
+  EndpointURI_Log = '/log';
+  EndpointURI_Mail = '/mail';
+  EndpointURI_OAuth2 = '/oauth2';
 
+  SpecialRequestParam_RemoteIP = 'remoteip';
+  SpecialRequestParam_Context_Issuer = 'context_issuer';
+
+  logdestinationServerConsole='serverconsole';
 
 implementation
 

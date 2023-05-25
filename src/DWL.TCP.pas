@@ -47,22 +47,32 @@ const
     FWritePos: PByte;
     FWriteBufLeft: cardinal;
     FCloseConnection: boolean;
+    FContext_HostName: string;
     FWritesInProgress: cardinal;
     procedure CreateRecvRequest;
     procedure HandleCurrentWriteBuffer;
-    procedure WSA_ShutdownOnError(ResultCode: Integer; const Op: string);
+    function CheckWSAResult_ShutdownOnError(ResultCode: Integer; const LogErrorWithThisString: string=''): integer;
   private
     FSocketCS: TCriticalSection;
     FShutdownTick: UInt64;
     FTransmitBuffers: TdwlThreadList<PdwlTransmitBuffer>;
     FHandlingBuffers: TdwlThreadList<PdwlHandlingBuffer>;
+    FIp_Local: string;
+    FIp_Remote: string;
+    FPort_Local: word;
+    FPort_Remote: word;
   protected
     FService: TdwlTCPService;
     procedure CreateWriteBuffer;
   public
+    property Ip_Local: string read FIp_Local;
+    property Ip_Remote: string read FIp_Remote;
+    property Port_Local: word read FPort_Local;
+    property Port_Remote: word read FPort_Remote;
     property Service: TdwlTCPService read FService;
     property SocketHandle: TSocket read FSocketHandle;
     property SocketVars: pointer read FSocketVars;
+    property Context_HostName: string read FContext_HostName write FContext_HostName;
     constructor Create(AService: TdwlTCPService); virtual;
     destructor Destroy; override;
     procedure ReadHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer); virtual;
@@ -73,7 +83,7 @@ const
     procedure ShutdownDetected;
     procedure StartReceiving;
     procedure WriteBuf(Buf: PByte; Size: integer);
-    procedure WriteLine(const Str: string);
+    procedure WriteLine(const Str: string='');
     procedure WriteStr(const Str: string);
     procedure WriteUInt8(B: byte);
   end;
@@ -103,6 +113,7 @@ const
   protected
     procedure InternalActivate; virtual;
     procedure InternalDeActivate; virtual;
+    procedure SetSocketAddresses(Socket: TdwlSocket; const Ip_Local: string; Port_Local: word; const Ip_Remote: string; Port_Remote: word);
   public
     property Active: boolean read FActive write SetActive;
     property CodePage_US_ASCII: integer read FCodePage_US_ASCII;
@@ -116,8 +127,8 @@ const
     procedure ReleaseTransmitBuffer(TransmitBuffer: PdwlTransmitBuffer);
   end;
 
-function CheckWSAResult(ResultCode: Integer; const Op: string): Integer; overload;
-function CheckWSAResult(ResultBool: boolean; const Op: string): Integer; overload;
+function CheckWSAResult(ResultCode: Integer; const LogErrorWithThisString: string=''): Integer; overload;
+function CheckWSAResult(ResultBool: boolean; const LogErrorWithThisString: string=''): Integer; overload;
 function WSARecv2(s: TSocket; lpBuffers: LPWSABUF; dwBufferCount: DWORD;
   lpNumberOfBytesRecvd: PCardinal; var lpFlags: DWORD; lpOverlapped: LPWSAOVERLAPPED;
   lpCompletionRoutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE): Integer; stdcall;
@@ -139,22 +150,22 @@ const
   CLEANUPTHREAD_SLEEP_MSECS = 300;
   CLEANUP_DELAY_MSECS = 750;
 
-function CheckWSAResult(ResultCode: Integer; const Op: string): Integer;
+function CheckWSAResult(ResultCode: Integer; const LogErrorWithThisString: string=''): Integer;
 begin
   if ResultCode<>0 then
   begin
     Result := WSAGetLastError;
-    if (Result<>WSAEWOULDBLOCK) and (Result<>integer(WSA_IO_PENDING)) and (Result<>integer(WSA_IO_INCOMPLETE)) then
-      TdwlLogger.Log('Winsock error: '+SysErrorMessage(Result)+' ('+Result.ToString+')'+IfThen(Op<>'',' in '+Op), lsError);
+    if (LogErrorWithThisString<>'') and (Result<>WSAEWOULDBLOCK) and (Result<>integer(WSA_IO_PENDING)) and (Result<>integer(WSA_IO_INCOMPLETE)) then
+      TdwlLogger.Log('Winsock error: '+SysErrorMessage(Result)+' ('+Result.ToString+') in '+LogErrorWithThisString, lsError);
   end
   else
     Result := 0;
 end;
 
-function CheckWSAResult(ResultBool: boolean; const Op: string): Integer;
+function CheckWSAResult(ResultBool: boolean; const LogErrorWithThisString: string): Integer;
 begin
   if not ResultBool then
-    Result := CheckWSAResult(-1, Op)
+    Result := CheckWSAResult(-1, LogErrorWithThisString)
   else
     Result := 0;
 end;
@@ -201,7 +212,10 @@ end;
 
 procedure TdwlSocket.SendTransmitBuffer(TransmitBuffer: PdwlTransmitBuffer);
 begin
-  WSA_ShutdownOnError(WSASend2(SocketHandle, @TransmitBuffer.WSABuf, 1, nil, 0, LPWSAOVERLAPPED(TransmitBuffer), nil), 'WSASend');
+  var Res := CheckWSAResult_ShutdownOnError(WSASend2(SocketHandle, @TransmitBuffer.WSABuf, 1, nil, 0, LPWSAOVERLAPPED(TransmitBuffer), nil));
+  if (Res<>0) and (Res<>WSAECONNRESET) and (Res<>WSAEWOULDBLOCK) and (Res<>integer(WSA_IO_PENDING)) and (Res<>integer(WSA_IO_INCOMPLETE)) then
+    TdwlLogger.Log('Winsock error: '+SysErrorMessage(Res)+' ('+Res.ToString+') in SendTransmitBuffer', lsError);
+  AtomicIncrement(FWritesInProgress);
 end;
 
 procedure TdwlSocket.Shutdown;
@@ -260,7 +274,7 @@ begin
   end;
 end;
 
-procedure TdwlSocket.WriteLine(const Str: string);
+procedure TdwlSocket.WriteLine(const Str: string='');
 begin
   WriteStr(Str);
   WriteUInt8(13);
@@ -281,12 +295,10 @@ begin
   WriteBuf(@B, 1);
 end;
 
-procedure TdwlSocket.WSA_ShutdownOnError(ResultCode: Integer; const Op: string);
+function TdwlSocket.CheckWSAResult_ShutdownOnError(ResultCode: Integer; const LogErrorWithThisString: string=''): integer;
 begin
-  if ResultCode=0 then
-    Exit;
-  Resultcode := CheckWSAResult(ResultCode, Op);
-  if (ResultCode<>0) and (ResultCode<>WSA_IO_PENDING) then
+  Result := CheckWSAResult(ResultCode, LogErrorWithThisString);
+  if (Result<>0) and (Result<>WSA_IO_PENDING) then
     ShutDown;
 end;
 
@@ -306,7 +318,7 @@ begin
   FSocketHandle := WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, nil, 0, WSA_FLAG_OVERLAPPED);
   //and attach to IoCompletionPort
 	if CreateIoCompletionPort(SocketHandle, FService.FIoCompletionPort, 0, 0)=0 then
-    WSA_ShutdownOnError(-1, 'CreateIoCompletionPort');
+    CheckWSAResult_ShutdownOnError(-1, 'CreateIoCompletionPort');
   CreateWriteBuffer;
 end;
 
@@ -316,7 +328,9 @@ begin
   Inc(FReadLastID);
   TransmitBuffer.CompletionId := FReadLastID;
   var EmptyFlags: cardinal := 0;
-  WSA_ShutdownOnError(WSARecv2(SocketHandle, @TransmitBuffer.WSABuf, 1, nil, EmptyFlags, LPWSAOVERLAPPED(TransmitBuffer), nil), 'WSARecv');
+  var Res:= CheckWSAResult_ShutdownOnError(WSARecv2(SocketHandle, @TransmitBuffer.WSABuf, 1, nil, EmptyFlags, LPWSAOVERLAPPED(TransmitBuffer), nil));
+  if (Res<>0) and (Res<>WSAECONNRESET) and (Res<>WSAEWOULDBLOCK) and (Res<>integer(WSA_IO_PENDING)) and (Res<>integer(WSA_IO_INCOMPLETE)) then
+    TdwlLogger.Log('Winsock error: '+SysErrorMessage(Res)+' ('+Res.ToString+') in CreateRecvRequest', lsError);
 end;
 
 procedure TdwlSocket.CreateWriteBuffer;
@@ -444,7 +458,7 @@ begin
   GetMem(Result, Sizeof(TdwlTransmitBuffer));
   Getmem(Result.WSABuf.buf, DWL_TCP_BUFFER_SIZE);
   Result.Socket := Socket;
-  Result.WSABuf.len := DWL_TCP_BUFFER_SIZE; // also for existing buffers, could have been changed while sending
+  Result.WSABuf.len := DWL_TCP_BUFFER_SIZE;
   ZeroMemory(@Result.Overlapped, SizeOf(TOverlapped));
   Result.CompletionIndicator := CompletionIndicator;
   Socket.FTransmitBuffers.Add(Result);
@@ -484,7 +498,7 @@ begin
   FActiveSockets.Free;
   FInActiveSockets.Free;
   // cleanup winsock
-  CheckWSAResult(WSACleanup, 'WSACleanup');;
+  CheckWSAResult(WSACleanup, 'WSACleanup');
   FIoThreads.Free;
   inherited Destroy;
 end;
@@ -550,7 +564,7 @@ function TdwlTCPService.AcquireHandlingBuffer(Socket: TdwlSocket): PdwlHandlingB
 begin
   GetMem(Result, Sizeof(TdwlHandlingBuffer));
   Getmem(Result.Buf, DWL_TCP_BUFFER_SIZE);
-  Result.NumberOfBytes := DWL_TCP_BUFFER_SIZE; // also for existing buffers, could have been changed while sending
+  Result.NumberOfBytes := DWL_TCP_BUFFER_SIZE;
   Result.Socket := Socket;
   Socket.FHandlingBuffers.Add(Result);
 end;
@@ -564,6 +578,14 @@ begin
   else
     InternalDeActivate;
   FActive := Value;
+end;
+
+procedure TdwlTCPService.SetSocketAddresses(Socket: TdwlSocket; const IP_Local: string; Port_Local: word; const IP_Remote: string; Port_Remote: word);
+begin
+  Socket.FIp_Local := Ip_Local;
+  Socket.FPort_Local := Port_Local;
+  Socket.FIp_Remote := Ip_Remote;
+  Socket.FPort_Remote := Port_Remote;
 end;
 
 { TIoThread }
@@ -597,7 +619,7 @@ begin
       end;
     except
       on E: Exception do
-        TdwlLogger.Log('TIoThread.Execute error: '+E.Message, lsError);
+        TdwlLogger.Log(E);
     end;
   end;
   FService.FIoThreads.Remove(Self);

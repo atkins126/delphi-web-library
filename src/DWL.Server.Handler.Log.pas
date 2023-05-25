@@ -3,16 +3,14 @@
 ///   DWL logging API. Requests are handled triggered, filtered etc and at the
 ///   end saved in the database
 /// </summary>
-unit DWL.HTTP.Server.Handler.Log;
+unit DWL.Server.Handler.Log;
 
 interface
 
 uses
-  DWL.HTTP.Server, DWL.HTTP.Server.Types, DWL.Params,
-  System.Generics.Collections, System.SysUtils, System.SyncObjs, DWL.SyncObjs;
-
-const
-  logdestinationServerConsole='serverconsole';
+  DWL.Server, DWL.Server.Types, DWL.Params,
+  System.Generics.Collections, System.SysUtils, System.SyncObjs, DWL.SyncObjs,
+  System.RegularExpressions;
 
 const
   Param_EMail_To = 'email_to';
@@ -26,10 +24,11 @@ type
     FId: integer;
     FMinLevel: byte;
     FMaxLevel: byte;
-    FChannel: string;
-    FTopic: string;
+    FChannel: TRegEx;
+    FTopic: TRegEx;
     FParameters: string;
     FSuppressDuplicateMSecs: cardinal;
+    FSuppressEvaluateContent: boolean;
     // suppresshash is a list of hashes and the tick when the hashed value should not longer be suppressed
     FSuppressHashes: TDictionary<integer, UInt64>;
     // cleanup is done every TRIGGER_CLEANUP_COUNT trigger events
@@ -39,11 +38,12 @@ type
     property Id: integer read FId;
     property MinLevel: byte read FMinLevel write FMinLevel;
     property MaxLevel: byte read FMaxLevel write FMaxLevel;
-    property Channel: string read FChannel write FChannel;
-    property Topic: string read FTopic write FTopic;
+    property Channel: TRegEx read FChannel write FChannel;
+    property Topic: TRegEx read FTopic write FTopic;
     property Parameters: string read FParameters write FParameters;
     property SuppressDuplicateMSecs: cardinal read FSuppressDuplicateMSecs write SetSuppressDuplicateMSecs;
-    function IsSuppressed(Level: Byte; const Source, Channel, Topic, Msg: string): boolean;
+    property SuppressEvaluateContent: boolean read FSuppressEvaluateContent write FSuppressEvaluateContent;
+    function IsSuppressed(Level: Byte; const Source, Channel, Topic, Msg: string; Content: TBytes): boolean;
   public
     constructor Create(AId: integer);
     destructor Destroy; override;
@@ -61,12 +61,11 @@ type
     function Post_Log(const State: PdwlHTTPHandlingState): boolean;
     function Options_Log(const State: PdwlHTTPHandlingState): boolean;
     procedure ProcessTriggers(const IpAddress: string; Level: Byte; const Source, Channel, Topic, Msg, ContentType: string; const Content: TBytes);
-  protected
-    function ProcessRequest(const State: PdwlHTTPHandlingState): boolean; override;
   public
     constructor Create(AParams: IdwlParams);
     destructor Destroy; override;
     function Authorize(const State: PdwlHTTPHandlingState): boolean; override;
+    function ProcessRequest(const State: PdwlHTTPHandlingState): boolean; override;
     function SubmitLog(const IpAddress: string; Level: Byte; const Source, Channel, Topic, Msg, ContentType: string; const Content: TBytes): boolean;
   end;
 
@@ -74,9 +73,9 @@ implementation
 
 uses
   DWL.Params.Consts, DWL.MySQL, DWL.HTTP.Consts, DWL.Logging,
-  DWL.HTTP.Server.Globals, DWL.HTTP.Server.Utils, System.Masks, System.Classes,
+  DWL.Server.Globals, DWL.Server.Utils, System.Masks, System.Classes,
   IdMessage, System.StrUtils, IdAttachmentMemory, DWL.Mail.Queue,
-  Winapi.WinInet, Winapi.Windows, System.Math, System.Hash;
+  Winapi.WinInet, Winapi.Windows, System.Math, System.Hash, DWL.Server.Consts;
 
 const
   TRIGGER_RELOAD_MSECS = 60000; // 1 minute
@@ -119,10 +118,10 @@ procedure TdwlHTTPHandler_Log.InitializeDatabase;
 const
   SQL_CheckTable_LogDebug=
     'CREATE TABLE IF NOT EXISTS dwl_log_debug ('+
-    '`Id` INT(11) NOT NULL AUTO_INCREMENT, '+
+    '`Id` INT UNSIGNED NOT NULL AUTO_INCREMENT, '+
     '`IpAddress` VARCHAR(50), '+
-    '`TimeStamp` DATETIME  DEFAULT CURRENT_TIMESTAMP, '+
-    '`Level` TINYINT  DEFAULT 0, '+
+    '`TimeStamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP, '+
+    '`Level` TINYINT UNSIGNED DEFAULT 0, '+
     '`Source` VARCHAR(50), '+
     '`Channel` VARCHAR(50), '+
     '`Topic` VARCHAR(50), '+
@@ -132,10 +131,10 @@ const
     'PRIMARY KEY (`ID`))';
   SQL_CheckTable_LogMessages=
     'CREATE TABLE IF NOT EXISTS dwl_log_messages ('+
-    '`Id` INT(11) NOT NULL AUTO_INCREMENT, '+
+    '`Id` INT UNSIGNED NOT NULL AUTO_INCREMENT, '+
     '`IpAddress` VARCHAR(50), '+
-    '`TimeStamp` DATETIME  DEFAULT CURRENT_TIMESTAMP, '+
-    '`Level` TINYINT  DEFAULT 0, '+
+    '`TimeStamp` TIMESTAMP  DEFAULT CURRENT_TIMESTAMP, '+
+    '`Level` TINYINT UNSIGNED DEFAULT 0, '+
     '`Source` VARCHAR(50), '+
     '`Channel` VARCHAR(50), '+
     '`Topic` VARCHAR(50), '+
@@ -145,14 +144,15 @@ const
     'PRIMARY KEY (`ID`))';
   SQL_CheckTable_LogTriggers=
     'CREATE TABLE IF NOT EXISTS `dwl_log_triggers` ('+
-    '`Id` INT(11) NOT NULL AUTO_INCREMENT, '+
-    '`Level_From` TINYINT, '+
-    '`Level_To` TINYINT, '+
+    '`Id` INT UNSIGNED NOT NULL AUTO_INCREMENT, '+
+    '`Level_From` TINYINT UNSIGNED, '+
+    '`Level_To` TINYINT UNSIGNED, '+
     '`Channel` VARCHAR(50), '+
     '`Topic` VARCHAR(50), '+
     '`Parameters` TEXT, '+
-    '`SuppressDuplicateSeconds` INT, '+
-    'PRIMARY KEY (`ID`))';
+    '`SuppressDuplicateSeconds` SMALLINT UNSIGNED, '+
+    '`SuppressEvaluateContent` TINYINT UNSIGNED, '+
+    'PRIMARY KEY (`Id`))';
 begin
   FMySQL_Profile.WriteValue(Param_CreateDatabase, true);
   FMySQL_Profile.WriteValue(Param_TestConnection, true);
@@ -167,7 +167,10 @@ end;
 procedure TdwlHTTPHandler_Log.CheckTriggers(TrigList: TList<TLogTrigger>);
 const
   SQL_Get_Triggers=
-    'SELECT Id, Level_From, Level_to, Channel, Topic, Parameters, SuppressDuplicateSeconds FROM dwl_log_triggers';
+    'SELECT Id, Level_From, Level_to, Channel, Topic, Parameters, SuppressDuplicateSeconds, SuppressEvaluateContent FROM dwl_log_triggers';
+  GetTriggers_Idx_Id=0; GetTriggers_Idx_Level_From=1; GetTriggers_Idx_Level_to=2;
+  GetTriggers_Idx_Channel=3; GetTriggers_Idx_Topic=4; GetTriggers_Idx_Parameters=5;
+  GetTriggers_Idx_SuppressDuplicateSeconds=6; GetTriggers_Idx_SuppressEvaluateContent=7;
 begin
   try
     var Tick := GetTickCount64;
@@ -184,7 +187,7 @@ begin
       Cmd.Execute;
       while Cmd.Reader.Read do
       begin
-        var TriggerId := Cmd.Reader.GetInteger(0);
+        var TriggerId := Cmd.Reader.GetInteger(GetTriggers_Idx_Id);
         var Trigger: TLogTrigger;
         if not PreviousTriggers.TryGetValue(TriggerId, Trigger) then
           Trigger := TLogTrigger.Create(TriggerId)
@@ -193,12 +196,25 @@ begin
         // never have triggers for levels below lsNotice
         // said in another way: triggering only acts on the items put in the dwl_log_messages table
         // (ignore the items from dwl_log_debug)
-        Trigger.MinLevel := Max(integer(lsNotice), Cmd.Reader.GetInteger(1, true));
-        Trigger.MaxLevel := Cmd.Reader.GetInteger(2, true, integer(lsFatal));
-        Trigger.Channel := Cmd.Reader.GetString(3, true, '*');
-        Trigger.Topic := Cmd.Reader.GetString(4, true, '*');
-        Trigger.Parameters := Cmd.Reader.GetString(5, true);
-        Trigger.SuppressDuplicateMSecs := Max(0, Cmd.Reader.GetInteger(6, true))*1000;
+        Trigger.MinLevel := Max(integer(lsNotice), Cmd.Reader.GetInteger(GetTriggers_Idx_Level_From, true));
+        Trigger.MaxLevel := Cmd.Reader.GetInteger(GetTriggers_Idx_Level_to, true, integer(lsFatal));
+        var RegExStr := Cmd.Reader.GetString(GetTriggers_Idx_Channel, true, '.*');
+        try
+          Trigger.Channel := TRegEx.Create(RegExStr, [roCompiled, roSingleLine]);
+        except
+          TdwlLogger.Log('Invalid regex for Channel (TriggerID='+TriggerID.ToString+'): '+RegExStr);
+          Trigger.Channel := TRegEx.Create('.*', [roCompiled, roSingleLine]);
+        end;
+        RegExStr := Cmd.Reader.GetString(GetTriggers_Idx_Topic, true, '.*');
+        try
+          Trigger.Topic := TRegEx.Create(RegExStr, [roCompiled, roSingleLine]);
+        except
+          TdwlLogger.Log('Invalid regex for Topic (TriggerID='+TriggerID.ToString+'): '+RegExStr);
+          Trigger.Topic := TRegEx.Create('.*', [roCompiled, roSingleLine]);
+        end;
+        Trigger.Parameters := Cmd.Reader.GetString(GetTriggers_Idx_Parameters, true);
+        Trigger.SuppressDuplicateMSecs := Max(0, Cmd.Reader.GetInteger(GetTriggers_Idx_SuppressDuplicateSeconds, true))*1000;
+        Trigger.SuppressEvaluateContent := Cmd.Reader.GetInteger(GetTriggers_Idx_SuppressEvaluateContent, true)<>0;
         TrigList.Add(Trigger);
       end;
       // dispose no longer used triggers
@@ -241,7 +257,7 @@ begin
     Exit;
   if not State.TryGetRequestParamStr('msg', Msg) then
     Exit;
-  if not State.TryGetRequestParamStr('remoteip', IpAddress) then
+  if not State.TryGetRequestParamStr(SpecialRequestParam_RemoteIP, IpAddress) then
     IpAddress := '';
   var LevelStr: string;
   if not (State.TryGetRequestParamStr('level', LevelStr) and integer.TryParse(LevelStr, Level)) then
@@ -270,7 +286,6 @@ begin
   if not SubmitLog(IpAddress, Level, Source, Channel, Topic, Msg, ContentType, Content) then
     State.StatusCode := HTTP_STATUS_SERVER_ERROR;
   serverProcs.SetHeaderValueProc(State, 'Access-Control-Allow-Origin', '*');
-  State.Flags := State.Flags or HTTP_FLAG_NOLOGGING;
   Result := true;
 end;
 
@@ -279,10 +294,10 @@ begin
   Result := false;
   if SameText(State.URI, '') then
   begin
-    if State.Command=dwlhttpPOST then
+    if State.RequestMethod=dwlhttpPOST then
       Result := Post_Log(State)
     else
-    if State.Command=dwlhttpOPTIONS then
+    if State.RequestMethod=dwlhttpOPTIONS then
       Result := Options_Log(State);
   end;
 end;
@@ -295,9 +310,9 @@ begin
       CheckTriggers(TrigList);
       for var Trig in TrigList do
       begin
-        if MatchesMask(Channel, Trig.Channel) and MatchesMask(Topic, Trig.Topic) and
+        if Trig.Channel.IsMatch(Channel) and Trig.Topic.IsMatch(Topic) and
           (Level>=Trig.MinLevel) and (Level<=Trig.MaxLevel) and
-          (not Trig.IsSuppressed(Level, Source, Channel, Topic, Msg)) then
+          (not Trig.IsSuppressed(Level, Source, Channel, Topic, Msg, Content)) then
         begin
           var Parms := TStringList.Create;
           try
@@ -417,7 +432,7 @@ begin
   inherited Destroy;
 end;
 
-function TLogTrigger.IsSuppressed(Level: Byte; const Source, Channel, Topic, Msg: string): boolean;
+function TLogTrigger.IsSuppressed(Level: Byte; const Source, Channel, Topic, Msg: string; Content: TBytes): boolean;
 begin
   if FSuppressHashes=nil then
     Exit(false);
@@ -445,6 +460,8 @@ begin
   Hash.Update(Source);
   Hash.Update(Channel);
   Hash.Update(Topic);
+  if SuppressEvaluateContent then
+    Hash.Update(Content);
   // is hash present in
   var SuppressUntilLogTick: UInt64;
   Result := FSuppressHashes.TryGetValue(Hash.HashAsInteger, SuppressUntilLogTick);

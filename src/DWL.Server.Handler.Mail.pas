@@ -2,12 +2,12 @@
 ///   A specific handler that can be added to a TdwlHTTPServer for exposing
 ///   a possibility to drop an email for sending
 /// </summary>
-unit DWL.HTTP.Server.Handler.Mail;
+unit DWL.Server.Handler.Mail;
 
 interface
 
 uses
-  DWL.HTTP.Server, DWL.HTTP.Server.Types, DWL.Params;
+  DWL.Server.Types, DWL.Params, DWL.Server;
 
 type
   TdwlHTTPHandler_Mail = class(TdwlHTTPHandler)
@@ -15,18 +15,17 @@ type
     FLogSecret: string;
     function Post_Mail(const State: PdwlHTTPHandlingState): boolean;
     function Options_Mail(const State: PdwlHTTPHandlingState): boolean;
-  protected
-    function ProcessRequest(const State: PdwlHTTPHandlingState): boolean; override;
   public
     constructor Create(AParams: IdwlParams);
     function Authorize(const State: PdwlHTTPHandlingState): boolean; override;
+    function ProcessRequest(const State: PdwlHTTPHandlingState): boolean; override;
   end;
 
 implementation
 
 uses
-  DWL.HTTP.Consts, DWL.HTTP.Server.Globals, DWL.HTTP.Server.Utils,
-  System.SysUtils, DWL.Classes, IdMessage, DWL.Mail.Queue;
+  DWL.HTTP.Consts, DWL.Server.Globals, DWL.Server.Utils,
+  System.SysUtils, DWL.Classes, IdMessage, DWL.Mail.Queue, DWL.Server.Consts;
 
 
 { TdwlHTTPHandler_Mail }
@@ -88,10 +87,10 @@ begin
   Result := false;
   if SameText(State.URI, '') then
   begin
-    if State.Command=dwlhttpPOST then
+    if State.RequestMethod=dwlhttpPOST then
       Result := Post_Mail(State)
     else
-    if State.Command=dwlhttpOPTIONS then
+    if State.RequestMethod=dwlhttpOPTIONS then
       Result := Options_Mail(State);
   end;
 end;

@@ -18,6 +18,7 @@ type
     class procedure ParamChanged(Sender: IdwlParams; const Key: string; const Value: TValue); static;
     class procedure CreateMailSendThread; static;
     class procedure CheckMailSendThread; static;
+    class procedure KillMailSendThread; static;
   private
   class var
     FMailAddedEvent: THandle;
@@ -115,8 +116,8 @@ const
   SQL_CheckTable = 'CREATE TABLE IF NOT EXISTS dwl_mailqueue (' +
     'Id INT UNSIGNED NOT NULL AUTO_INCREMENT, ' +
     'MomentInQueue DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, ' +
-    'Status TINYINT NOT NULL DEFAULT ''0'', ' +
-    'Attempts TINYINT NULL DEFAULT ''0'', ' +
+    'Status TINYINT UNSIGNED NOT NULL DEFAULT ''0'', ' +
+    'Attempts TINYINT UNSIGNED NULL DEFAULT ''0'', ' +
     'DelayedUntil DATETIME NULL DEFAULT NULL, ' +
     'MomentSent DATETIME NULL DEFAULT NULL, ' +
     'ProcessingLog TEXT NULL, ' +
@@ -125,7 +126,11 @@ const
     'PRIMARY KEY (Id), ' +
     'INDEX `StatusDelayedUntilIndex` (`Status`, `DelayedUntil`))';
 begin
-  FParams := Params;
+  KillMailSendThread;
+  FDomainContexts.Clear;
+  FParams := New_Params;
+  if Params<>nil then
+    Params.AssignTo(FParams);
   if EnableMailSending then
   begin
     FParams.WriteValue(Param_CreateDatabase, true);
@@ -134,7 +139,6 @@ begin
     FParams.ClearKey(Param_CreateDatabase);
     FParams.ClearKey(Param_TestConnection);
     SeSsion.CreateCommand(SQL_CheckTable).Execute;
-    FDomainContexts := TDictionary<string, IdwlParams>.Create;
     var DomainContextStr := FParams.StrValue(Param_mailQueue_Domains);
     if DomainContextStr<>'' then
     begin
@@ -182,6 +186,7 @@ end;
 class constructor TdwlMailQueue.Create;
 begin
   inherited;
+  FDomainContexts := TDictionary<string, IdwlParams>.Create;
   FMailAddedEvent := CreateEvent(nil, false, false, nil);
 end;
 
@@ -199,17 +204,20 @@ end;
 
 class destructor TdwlMailQueue.Destroy;
 begin
-  // terminate thread
-  if FMailSendThread<>nil then
-  begin
-    FMailSendThread.Terminate;
-    SetEvent(FMailAddedEvent); {To wake up thread for termination}
-    FMailSendThread.WaitFor;
-    FMailSendThread.Free;
-  end;
+  KillMailSendThread;
   CloseHandle(FMailAddedEvent);
   FDomainContexts.Free;
   inherited;
+end;
+
+class procedure TdwlMailQueue.KillMailSendThread;
+begin
+  if FMailSendThread=nil then
+    Exit;
+  FMailSendThread.Terminate;
+  SetEvent(FMailAddedEvent); {To wake up thread for termination}
+  FMailSendThread.WaitFor;
+  FreeAndNil(FMailSendThread);
 end;
 
 class procedure TdwlMailQueue.Log(const Msg: string; SeverityLevel: TdwlLogSeverityLevel=lsNotice);
@@ -317,56 +325,61 @@ const
   MAX_ATTEMPTS = 5;
 begin
   try
-    var Session := New_MySQLSession(FParams);
-    var Cmd_Queue := Session.CreateCommand(SQL_GetQueuedMail);
-    Cmd_Queue.Parameters.SetIntegerDataBinding(0, ord(msSent));
-    Cmd_Queue.Parameters.SetIntegerDataBinding(1, MAX_ATTEMPTS);
-    Cmd_Queue.Execute;
-    var Reader := Cmd_Queue.Reader;
-    while Reader.Read do
-    begin
-      var Current_ID := Reader.GetInteger(0);
-      var Attempts := Reader.GetInteger(3, true);
-      var ProcessingLog := Reader.GetString(4, true);
-      inc(Attempts);
-      var Str := TStringStream.Create(Reader.GetString(1));
-      try
-        var Msg := TIdMessage.Create(nil);
+    try
+      var Session := New_MySQLSession(FParams);
+      var Cmd_Queue := Session.CreateCommand(SQL_GetQueuedMail);
+      Cmd_Queue.Parameters.SetIntegerDataBinding(0, ord(msSent));
+      Cmd_Queue.Parameters.SetIntegerDataBinding(1, MAX_ATTEMPTS);
+      Cmd_Queue.Execute;
+      var Reader := Cmd_Queue.Reader;
+      while Reader.Read do
+      begin
+        var Current_ID := Reader.GetInteger(0);
+        var Attempts := Reader.GetInteger(3, true);
+        var ProcessingLog := Reader.GetString(4, true);
+        inc(Attempts);
+        var Str := TStringStream.Create(Reader.GetString(1));
         try
-          Msg.LoadFromStream(Str);
-          Msg.BccList.EMailAddresses := Cmd_Queue.Reader.GetString(2, true);
-          var Update_SQL := SQL_UPDATE_part1;
-          var Res := ProcessMsg(Msg);
-          if Res.Success then
-            Update_SQL := Update_SQL+byte(msSent).ToString+SQL_UPDATE_part2_Complete
-          else
-          begin
-            if Attempts=MAX_ATTEMPTS then
-              Update_SQL := Update_SQL+byte(msError).ToString+SQL_UPDATE_part2_Error
+          var Msg := TIdMessage.Create(nil);
+          try
+            Msg.LoadFromStream(Str);
+            Msg.BccList.EMailAddresses := Cmd_Queue.Reader.GetString(2, true);
+            var Update_SQL := SQL_UPDATE_part1;
+            var Res := ProcessMsg(Msg);
+            if Res.Success then
+              Update_SQL := Update_SQL+byte(msSent).ToString+SQL_UPDATE_part2_Complete
             else
-              Update_SQL := Update_SQL+byte(msRetrying).ToString+SQL_UPDATE_part2_Retry;
-            ProcessingLog := ProcessingLog+#13#10+Res.ErrorMsg;
+            begin
+              if Attempts=MAX_ATTEMPTS then
+                Update_SQL := Update_SQL+byte(msError).ToString+SQL_UPDATE_part2_Error
+              else
+                Update_SQL := Update_SQL+byte(msRetrying).ToString+SQL_UPDATE_part2_Retry;
+              ProcessingLog := ProcessingLog+#13#10+Res.ErrorMsg;
+            end;
+            Update_SQL := Update_SQL+SQL_UPDATE_part3;
+            var Cmd := Session.CreateCommand(Update_SQL);
+            Cmd.Parameters.SetTextDataBinding(0, ProcessingLog);
+            Cmd.Parameters.SetIntegerDataBinding(1, Attempts);
+            Cmd.Parameters.SetIntegerDataBinding(2, Current_ID);
+            Cmd.Execute;
+            if Res.Success then
+              TdwlMailQueue.Log('Successfully sent mail to '+Msg.Recipients.EMailAddresses, lsTrace);
+            // never Log a failed mail attempt, you can read it back in the ProcessingLog
+            // a log will most probably generate a new mail and an infinite loop is created!!!!
+          finally
+            Msg.Free;
           end;
-          Update_SQL := Update_SQL+SQL_UPDATE_part3;
-          var Cmd := Session.CreateCommand(Update_SQL);
-          Cmd.Parameters.SetTextDataBinding(0, ProcessingLog);
-          Cmd.Parameters.SetIntegerDataBinding(1, Attempts);
-          Cmd.Parameters.SetIntegerDataBinding(2, Current_ID);
-          Cmd.Execute;
-          if Res.Success then
-            TdwlMailQueue.Log('Successfully sent mail to '+Msg.Recipients.EMailAddresses, lsTrace);
-          // never Log a failed mail attempt, you can read it back in the ProcessingLog
-          // a log will most probably generate a new mail and an infinite loop is created!!!!
         finally
-          Msg.Free;
+          Str.Free;
         end;
-      finally
-        Str.Free;
-      end;
-     end;
-  finally
-    FreeSMTP;
-    FCurrentContextParams := nil;
+       end;
+    finally
+      FreeSMTP;
+      FCurrentContextParams := nil;
+    end;
+  except
+    on E:Exception do
+      TdwlLogger.Log(E);
   end;
 end;
 

@@ -3,24 +3,36 @@ unit DWL.Mail.Utils;
 interface
 
 uses
-  IdMessage, DWL.Classes;
+  IdMessage, System.SysUtils, DWL.Classes;
 
 type
-  TdwlMailCheckOption=(mcEmptyStringIsValid, mcDoNotTrimSpaces, mcEvaluateCommaSeparatedList, mcEvaluateSemicolonSeparatedList);
+  TdwlMailCheckOption=(mcEmptyStringIsValid, mcDoNotTrimSpaces, mcEvaluateCommaSeparatedList);
   TdwlMailCheckOptions=set of TdwlMailCheckOption;
 
   TdwlMailUtils = record
     class function IsValidEmailAddress(const Value: string; Options: TdwlMailCheckOptions=[]): boolean; static;
     class function SendMailToAPI(const Endpoint, LogSecret: string; Msg: TIdMessage): TdwlResult; static;
+    class function IdMessageToBytes(Msg: TIdMessage): TBytes; static;
   end;
 
 implementation
 
 uses
   System.RegularExpressions, System.Classes, DWL.HTTP.Client, DWL.HTTP.Consts,
-  System.NetEncoding, System.SysUtils, Winapi.WinInet;
+  System.NetEncoding, Winapi.WinInet;
 
 { TdwlMailUtils }
+
+class function TdwlMailUtils.IdMessageToBytes(Msg: TIdMessage): TBytes;
+begin
+  var Stream := TBytesStream.Create;
+  try
+    Msg.SaveToStream(Stream);
+    Result := Stream.Bytes;
+  finally
+    Stream.Free;
+  end;
+end;
 
 class function TdwlMailUtils.IsValidEmailAddress(const Value: string; Options: TdwlMailCheckOptions=[]): boolean;
 const
@@ -37,16 +49,12 @@ begin
     EMail2Check := EMail2Check.Trim;
   if (EMail2Check='') then
     Exit(mcEmptyStringIsValid in Options);
-  if ([mcEvaluateCommaSeparatedList, mcEvaluateSemicolonSeparatedList]*Options<>[]) then
+  if mcEvaluateCommaSeparatedList in Options then
   begin
-    var NewOptions := Options - [mcEvaluateCommaSeparatedList, mcEvaluateSemicolonSeparatedList];
+    var NewOptions := Options - [mcEvaluateCommaSeparatedList];
     Result := true;
     repeat
-      var P := 0;
-      if mcEvaluateCommaSeparatedList in Options then
-        P := pos(',', EMail2Check);
-      if (P=0) and (mcEvaluateSemicolonSeparatedList in Options) then
-        P := pos(';', EMail2Check);
+      var P := pos(',', EMail2Check);
       if P>0 then
         Result := Result and TdwlMailUtils.IsValidEmailAddress(EMail2Check.Substring(0, P-1), NewOptions)
       else
@@ -74,8 +82,8 @@ begin
   finally
     Stream.Free;
   end;
-  Request.Header[HTTP_HEADER_CONTENT_TYPE] := CONTENT_TYPE_OCTET_STREAM;
-  Request.Method  := HTTP_COMMAND_POST;
+  Request.Header[HTTP_FIELD_CONTENT_TYPE] := CONTENT_TYPE_OCTET_STREAM;
+  Request.Method  := HTTP_METHOD_POST;
   var Response := Request.Execute;
   if Response.StatusCode<>HTTP_STATUS_OK then
     Result.AddErrorMsg('Error '+Response.StatusCode.ToString);

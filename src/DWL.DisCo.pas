@@ -28,7 +28,7 @@ type
     class function VersionParams: IdwlParams;
     class function TempUpdateDir: string;
     class procedure ProgressMsg(const Msg: string; ProcessingFinished: boolean=false);
-    class function CheckDLL(const PackageName, FileVersion: string): boolean;
+    class function CheckDLL(const PackageName, FileVersion: string; WithoutAuthentication: boolean=false): boolean;
   protected
     class var
       FProgressBytesFunc: TdwlHTTPProgressEvent;
@@ -44,7 +44,7 @@ type
     class function CheckDLL_MySQL: boolean;
     class function CheckDLL_OpenSSL3: boolean;
     class function CheckDLL_WebView2: boolean;
-    class function GetReleaseInDir(const PackageName, DestinationDir: string; RequestPrerelease: boolean=false): boolean;
+    class function GetReleaseInDir(const PackageName, DestinationDir: string; RequestPrerelease: boolean=false; WithoutAuthentication: boolean=false): boolean;
   end;
 
 implementation
@@ -111,19 +111,19 @@ begin
   Result := true;
 end;
 
-class function TdwlDiscoClient.CheckDLL(const PackageName, FileVersion: string): boolean;
+class function TdwlDiscoClient.CheckDLL(const PackageName, FileVersion: string; WithoutAuthentication: boolean=false): boolean;
 begin
   var ExeDir := ExtractFileDir(ParamStr(0));
   var Fn := ExeDir+'\'+PackageName+'.dll';
   Result := FileExists(Fn) and (TdwlFileVersionInfo.CreateFromFile(Fn)>=TdwlFileVersionInfo.CreateFromString(FileVersion));
   if not Result then
-    Result := GetReleaseInDir(PackageName, ExeDir);
+    Result := GetReleaseInDir(PackageName, ExeDir, false, WithoutAuthentication);
 end;
 
 class function TdwlDiscoClient.CheckDLL_7Z: boolean;
 begin
   {$IFDEF WIN64}
-  Result := CheckDLL('7z64', '18.5.0');
+  Result := CheckDLL('7z64', '18.5.0', true);
   {$ELSE}
   Result := CheckDLL('7z', '18.5.0');
   {$ENDIF}
@@ -141,7 +141,7 @@ end;
 class function TdwlDiscoClient.CheckDLL_OpenSSL3: boolean;
 begin
   {$IFDEF WIN64}
-  Result := CheckDLL('libcrypto-3-x64', '3.0.0');
+  Result := CheckDLL('libcrypto-3-x64', '3.0.0', true);
   {$ELSE}
   Result := false;
   {$ENDIF}
@@ -180,7 +180,7 @@ end;
 
 class function TdwlDiscoClient.CheckPreReleaseUpdate: TdwlResult;
 begin
-  var Response := TdwlDisco.FApiSession.ExecuteJSONRequest('release', HTTP_COMMAND_GET, 'packagename='+AppName);
+  var Response := TdwlDisco.FApiSession.ExecuteJSONRequest('release', HTTP_METHOD_GET, 'packagename='+AppName);
   if (not Response.Success) or (Response.Data.GetValue<integer>('kind')<>discoreleasekindPreRelease) then
   begin
     Result.AddErrorMsg('No PreRelease available right now.');
@@ -246,21 +246,21 @@ begin
   end;
 end;
 
-class function TdwlDiscoClient.GetReleaseInDir(const PackageName, DestinationDir: string; RequestPrerelease: boolean): boolean;
+class function TdwlDiscoClient.GetReleaseInDir(const PackageName, DestinationDir: string; RequestPrerelease: boolean=false; WithoutAuthentication: boolean=false): boolean;
 begin
   Result := false;
   try
     ProgressMsg('Downloading '+PackageName);
     try
-      var Response := FApiSession.ExecuteApiRequest('download/package', HTTP_COMMAND_GET, 'packagename='+TNetEncoding.URL.Encode(PackageName)+'&kind='+
-        IfThen(RequestPrerelease, discoreleasekindPreRelease, discoreleasekindRelease).ToString, true, false, FProgressBytesFunc);
+      var Response := FApiSession.ExecuteApiRequest(IfThen(WithoutAuthentication, 'download/supportpackage', 'download/package'), HTTP_METHOD_GET, 'packagename='+TNetEncoding.URL.Encode(PackageName)+'&kind='+
+        IfThen(RequestPrerelease, discoreleasekindPreRelease, discoreleasekindRelease).ToString, true, WithoutAuthentication, FProgressBytesFunc);
       if (Response=nil) or (Response.StatusCode<>HTTP_STATUS_OK) then
         Exit;
       var FileName: string;
       var DispList := TStringList.Create;
       try
         DispList.Delimiter := ';';
-        DispList.DelimitedText := Response.Header[HTTP_HEADER_CONTENT_DISPOSITION];
+        DispList.DelimitedText := Response.Header[HTTP_FIELD_CONTENT_DISPOSITION];
         FileName := DispList.Values['filename'];
       finally
         DispList.Free;
@@ -307,7 +307,7 @@ begin
   {$ENDIF}
   var Response: IdwlAPIResponse := nil;
   try
-    Response := FApiSession.ExecuteJSONRequest('phonehome', HTTP_COMMAND_GET, 'appname='+AppName.ToLower+IfThen(Profile<>'', '&profile='+Profile));
+    Response := FApiSession.ExecuteJSONRequest('phonehome', HTTP_METHOD_GET, 'appname='+AppName.ToLower+IfThen(Profile<>'', '&profile='+Profile));
   except
     Response := nil;
   end;

@@ -4,12 +4,13 @@
 /// </summary>
 unit DWL.HTTP.Client;
 
+{$I DWL.inc}
+
 interface
 
 uses
   System.Classes, System.SysUtils, DWL.HTTP.Types;
 
-{$I dwl.inc}
 
 type
   IdwlHTTPResponse = interface
@@ -83,7 +84,7 @@ type
     property Header[const HeaderKey: string]: string read GetHeader write SetHeader;
     /// <summary>
     ///   Change of onsult the calling method of the request, default it is
-    ///   HTTP_COMMAND_GET
+    ///   HTTP_METHOD_GET
     /// </summary>
     property Method: string read GetMethod write SetMethod;
     /// <summary>
@@ -253,7 +254,7 @@ end;
 constructor TdwlHTTPRequest.Create;
 begin
   inherited Create;
-  FMethod := HTTP_COMMAND_GET;
+  FMethod := HTTP_METHOD_GET;
   FTimeOut := 1000;
   FHeaderKeys := TStringList.Create;
   FHeaderKeys.CaseSensitive := false;

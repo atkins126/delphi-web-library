@@ -3,19 +3,23 @@ unit DisCo.Handler;
 interface
 
 uses
-  DWL.HTTP.Server.Handler.DLL.Classes, DWL.HTTP.Server.Types;
+  DWL.Server.Handler.DLL.Classes, DWL.Server.Types;
 
 type
   THandler_DisCo = class(TdwlDLLHandling_OpenID)
   strict private
-    class var FAdditionalParametersSQL: string;
+    class var
+      FAdditionalParametersSQL: string;
+      FSupportPackages: TArray<string>;
     class function Get_phonehome(const State: PdwlHTTPHandlingState): boolean;
     class function Get_download_package(const State: PdwlHTTPHandlingState): boolean;
+    class function Get_download_supportpackage(const State: PdwlHTTPHandlingState): boolean;
     class function Get_release(const State: PdwlHTTPHandlingState): boolean;
     class function Get_releases(const State: PdwlHTTPHandlingState): boolean;
     class function Post_profileip(const State: PdwlHTTPHandlingState): boolean;
     class function Post_upload_package(const State: PdwlHTTPHandlingState): boolean;
   public
+    class function Authorize(const State: PdwlHTTPHandlingState): boolean; override;
     class procedure Configure(const Params: string); override;
   end;
 
@@ -23,14 +27,23 @@ type
 implementation
 
 uses
-  DWL.HTTP.Consts, DWL.HTTP.Server.Utils, DWL.MySQL, DWL.Params.Consts,
+  DWL.HTTP.Consts, DWL.Server.Utils, DWL.MySQL, DWL.Params.Consts,
   System.JSON, DWL.Resolver, System.StrUtils, System.SysUtils, Winapi.WinInet,
-  DWL.HTTP.Server.Globals, DWL.DisCo.Consts, System.DateUtils;
+  DWL.Server.Globals, DWL.DisCo.Consts, System.DateUtils;
 
 const
   Param_Additional_parameters_SQL = 'additional_parameters_sql';
+  Param_supportpackages = 'supportpackages';
+  Uri_download_supportpackage = '/download/supportpackage';
 
 { THandler_DisCo }
+
+class function THandler_DisCo.Authorize(const State: PdwlHTTPHandlingState): boolean;
+begin
+  // support packages are free to download, mostly they're needed to be able to login
+  Result := SameText(State.URI, Uri_download_supportpackage) or
+    inherited Authorize(State);
+end;
 
 class procedure THandler_DisCo.Configure(const Params: string);
 const
@@ -50,9 +63,11 @@ begin
   Session.CreateCommand(SQL_CheckTable_ProfileParameters).Execute;
   Session.CreateCommand(SQL_CheckTable_KnownIps).Execute;
   FAdditionalParametersSQL := FConfigParams.StrValue(Param_Additional_parameters_SQL);
+  FSupportPackages := FConfigParams.StrValue(Param_supportpackages, '7z64,libcrypto-3-x64').Split([',']);
   var AdminScope := FConfigParams.StrValue('scope_admin', 'disco_admin');
   RegisterHandling(dwlhttpGET, '/phonehome', Get_phonehome, []);
   RegisterHandling(dwlhttpGET, '/download/package', Get_download_package, []);
+  RegisterHandling(dwlhttpGET, Uri_download_supportpackage, Get_download_supportpackage, []);
   RegisterHandling(dwlhttpGET, '/release', Get_release, []);
   RegisterHandling(dwlhttpGET, '/releases', Get_releases, [AdminScope]);
   RegisterHandling(dwlhttpPOST, '/profileip', Post_profileip, [AdminScope]);
@@ -220,7 +235,7 @@ begin
           serverProcs.ArrangeContentBufferProc(State, ContentBuffer, Size);
           Move(pBuffer^, ContentBuffer^, Size);
           State.SetContentType(CONTENT_TYPE_OCTET_STREAM);
-          State.SetHeaderValue(HTTP_HEADER_CONTENT_DISPOSITION, 'filename='+Cmd.Reader.GetString(2, true)+'.'+Cmd.Reader.GetString(1));
+          State.SetHeaderValue(HTTP_FIELD_CONTENT_DISPOSITION, 'filename='+Cmd.Reader.GetString(2, true)+'.'+Cmd.Reader.GetString(1));
         end
         else
           State.StatusCode := HTTP_STATUS_NO_CONTENT;
@@ -228,6 +243,23 @@ begin
   end
   else
     State.StatusCode := HTTP_STATUS_NO_CONTENT;
+end;
+
+class function THandler_DisCo.Get_download_supportpackage(const State: PdwlHTTPHandlingState): boolean;
+begin
+  // some packages are allowed to be downloaded without authentication
+  Result := true;
+  // check if packagename refers to a support package
+  var PackageName: string;
+  if not TryGetRequestParamStr(State, 'packagename', PackageName, true) then
+    Exit;
+  if not MatchText(PackageName, FSupportPackages) then
+  begin
+    State.StatusCode := HTTP_STATUS_DENIED;
+    Exit;
+  end;
+  // if so just call the generic download_package handler
+  Result := Get_download_package(State);
 end;
 
 class function THandler_DisCo.Post_profileip(const State: PdwlHTTPHandlingState): boolean;

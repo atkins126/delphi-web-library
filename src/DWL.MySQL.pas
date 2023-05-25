@@ -554,9 +554,7 @@ uses
   System.SysUtils;
 
 const
-  TIMEOUT_CONNECTION = 10000; //msecs = 10 sec;
-  TIMEOUT_LAST_CONNECTION = 300000; // 5min
-
+  TIMEOUT_CONNECTION = 300000; //msecs = 5 min
 
 type
   TConnectionProperties = record
@@ -588,6 +586,7 @@ type
     FBecamePassiveTick: UInt64;
     procedure MySqlChk(Res: longint);
     function PrepareStatement(const Query: UTF8String): PMYSQL_Stmt;
+    function IsTimedOut: boolean;
   public
     constructor Create(const AHost: string; APort: cardinal; const ADatabaseName, AUserName, APassword: string; ACreateDatabase: boolean=true; AUseSSL: boolean=false);
     destructor Destroy; override;
@@ -640,30 +639,16 @@ type
     destructor Destroy; override;
   end;
 
-  TCheckPassiveThread = class(TThread)
-  strict private
-    FManager: TdwlMySQLManager;
-  protected
-    procedure Execute; override;
-  public
-    constructor Create(Manager: TdwlMySQLManager);
-  end;
-
   TdwlMySQLManager = class
-  strict private
-    FCheckPassiveThread: TCheckPassiveThread;
   private
-    class var FInstance: TdwlMySQLManager;
-    FCheckPassiveThreadRunning: boolean;
-    FAccess: TCriticalSection;
-    FConnectionPools: TObjectDictionary<string, TConnectionPool>;
+    class var
+      FAccess: TCriticalSection;
+      FConnectionPools: TObjectDictionary<string, TConnectionPool>;
     class function CreateSession(Params: IdwlParams): IdwlMySQLSession;
   public
     class constructor Create;
     class destructor Destroy;
-    constructor Create;
-    destructor Destroy; override;
-  end;
+ end;
 
   { Class: TMySQLValueTypeDataBinding
     Description: Base class for implementing Value Type data bindings
@@ -883,6 +868,11 @@ begin
     MySqlChk(Execresult);
   except
   end;
+end;
+
+function TdwlMySQLConnection.IsTimedOut: boolean;
+begin
+  Result := (GetTickCount64-FBecamePassiveTick)>=TIMEOUT_CONNECTION;
 end;
 
 procedure TdwlMySQLConnection.MySqlChk(Res: longint);
@@ -1732,19 +1722,10 @@ end;
 // The expectation is that the amount of connection pools will be very low
 // but if you want to make the manager perfect: go and do your job
 
-constructor TdwlMySQLManager.Create;
-begin
-  inherited Create;
-  FAccess := TCriticalSection.Create;
-  FConnectionPools := TObjectDictionary<string, TConnectionPool>.Create([doOwnsValues]);
-  FCheckPassiveThreadRunning := true;
-  FCheckPassiveThread := TCheckPassiveThread.Create(Self);
-  FCheckPassiveThread.FreeOnTerminate := true;
-end;
-
 class constructor TdwlMySQLManager.Create;
 begin
-  FInstance := TdwlMySQLManager.Create;
+  FAccess := TCriticalSection.Create;
+  FConnectionPools := TObjectDictionary<string, TConnectionPool>.Create([doOwnsValues]);
 end;
 
 class function TdwlMySQLManager.CreateSession(Params: IdwlParams): IdwlMySQLSession;
@@ -1759,19 +1740,20 @@ begin
   ConnectionProperties.Database := Params.StrValue(Param_Db);
   ConnectionProperties.UseSSL := Params.BoolValue(Param_UseSSL, ParamDef_UseSSL);
   var ConnectionPool: TConnectionPool;
-  FInstance.FAccess.Enter;
+  FAccess.Enter;
   try
-    if not FInstance.FConnectionPools.TryGetValue(ConnectionProperties.UniqueIdentifier, ConnectionPool) then
+    if not FConnectionPools.TryGetValue(ConnectionProperties.UniqueIdentifier, ConnectionPool) then
       ConnectionPool := TConnectionPool.Create(ConnectionProperties, Params.StrValue(Param_Password), CreateDataBase, TestConnection);
   finally
-    FInstance.FAccess.Leave;
+    FAccess.Leave;
   end;
   Result := TdwlMySQLSession.Create(ConnectionPool);
 end;
 
 class destructor TdwlMySQLManager.Destroy;
 begin
-  FInstance.Free;
+  FConnectionPools.Free;
+  FAccess.Free;
 end;
 
 { TdwlConnectionPool }
@@ -1786,11 +1768,19 @@ begin
   FPassword := APassword;
 
   if TestConnection then
-    ReleaseConnection(TdwlMySQLConnection.Create(FConnectionProperties.Host, FConnectionProperties.Port, FConnectionProperties.Database, FConnectionProperties.UserName, FPassword, CreateDatabase, FConnectionProperties.UseSSL));
+  begin
+    var Conn := nil;
+    try
+      Conn := TdwlMySQLConnection.Create(FConnectionProperties.Host, FConnectionProperties.Port, FConnectionProperties.Database, FConnectionProperties.UserName, FPassword, CreateDatabase, FConnectionProperties.UseSSL);
+    finally
+      if Conn<>nil then
+       ReleaseConnection(Conn);
+    end;
+  end;
 
   // no need to do thread protection here
   // this create is only called from within a critical section in TdwlMySQLManager.CreateSession
-  TdwlMySQLManager.FInstance.FConnectionPools.Add(FConnectionProperties.UniqueIdentifier, Self);
+  TdwlMySQLManager.FConnectionPools.Add(FConnectionProperties.UniqueIdentifier, Self);
 end;
 
 destructor TConnectionPool.Destroy;
@@ -1825,15 +1815,19 @@ function TConnectionPool.GetConnection: TdwlMySQLConnection;
 begin
    Result := nil;
   // try to get a passive one
-  FAccess.Enter;
-  try
-    if FPassiveConnections.Count>0 then
-    begin
+  while Result=nil do
+  begin
+    FAccess.Enter;
+    try
+      if FPassiveConnections.Count=0 then
+        Break;
       Result := FPassiveConnections[0];
       FPassiveConnections.Delete(0);
+    finally
+      FAccess.Leave;
     end;
-  finally
-    FAccess.Leave;
+    if Result.IsTimedOut then
+      FreeAndNil(Result);
   end;
   // feed result (and create one if needed)
   FAccess.Enter;
@@ -1856,16 +1850,6 @@ begin
   finally
     FAccess.Leave;
   end;
-end;
-
-destructor TdwlMySQLManager.Destroy;
-begin
-  FCheckPassiveThread.Terminate;
-  while FCheckPassiveThreadRunning do
-    Sleep(100);
-  FConnectionPools.Free;
-  FAccess.Free;
-  inherited Destroy;
 end;
 
 { TdwlMySQLSession }
@@ -1910,50 +1894,6 @@ function TConnectionProperties.UniqueIdentifier: string;
 begin
   // better is a proper hash, but I'm lazy...
   Result := Host.ToLower+'##'+UserName+'##'+Database+'##'+Port.ToString+'##'+UseSSL.ToString;
-end;
-
-{ TCheckPassiveThread }
-
-constructor TCheckPassiveThread.Create(Manager: TdwlMySQLManager);
-begin
-  FManager := Manager;
-  inherited Create;
-end;
-
-procedure TCheckPassiveThread.Execute;
-begin
-  while not Terminated do
-  begin
-    // do your thing
-    var PoolIdents: TArray<String>;
-    FManager.FAccess.Enter;
-    try
-      // First get all connectionpool identifiers
-      PoolIdents := FManager.FConnectionPools.Keys.ToArray
-    finally
-      FManager.FAccess.Leave;
-    end;
-    for var i := 0 to High(PoolIdents) do
-    begin
-      if Terminated then
-        Break;
-      FManager.FAccess.Enter;
-      try
-        var Pool: TConnectionPool;
-        if FManager.FConnectionPools.TryGetValue(PoolIdents[i], Pool ) then
-          Pool.FreePassiveSessions(TIMEOUT_CONNECTION, TIMEOUT_LAST_CONNECTION);
-      finally
-        FManager.FAccess.Leave;
-      end;
-    end;
-    var i := 50;// sleep for five seconds, but respond earlier to canceled state
-    while (i>0) and (not Terminated) do
-    begin
-      Sleep(100);
-      dec(i);
-    end;
-  end;
-  FManager.FCheckPassiveThreadRunning := false;
 end;
 
 { TMySQLNullDataBinding }

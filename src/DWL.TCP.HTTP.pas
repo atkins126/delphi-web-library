@@ -12,26 +12,33 @@ type
 
 type
   TdwlHTTPSocket=class;
+  TdwlHTTPServer_OnLog=procedure(Request: TdwlHTTPSocket) of object;
+
 
   TdwlCustomHTTPServer = class(TdwlTCPServer)
+  strict private
+    FOnLog: TdwlHTTPServer_Onlog;
   protected
-    function HandleRequest(Request: TdwlHTTPSocket): boolean;
+    function HandleRequest(Request: TdwlHTTPSocket): boolean; virtual;
   public
+    property OnLog: TdwlHTTPServer_Onlog read FOnLog write FOnLog;
     constructor Create;
   end;
 
   TdwlHTTPSocket = class(TdwlSocket)
   strict private
-    FCommand: string;
+    FRequestMethod: byte;
     FUri: string;
     FState: TdwlHTTPServerConnectionState;
     FPendingLine: string;
+    FRequestParams: TStringList;
     FRequestHeaders: IdwlParams;
     FResponseHeaders: IdwlParams;
     FRequestBodyStream: TMemoryStream;
     FResponseDataStream: TMemoryStream;
     FContentLength: integer;
     FStatusCode: integer;
+    FTickStart: UInt64;
     FProtocol: TdwlHTTPProtocol;
     FReadError: string;
     procedure ClearCurrentRequest;
@@ -39,8 +46,17 @@ type
     procedure ReadFinishHeader;
     procedure ReadPendingLine;
     procedure ReadProcessRequest;
+    procedure ReadProcessURI;
   public
+    property RequestMethod: byte read FRequestMethod;
+    property RequestBodyStream: TMemoryStream read FRequestBodyStream;
+    property RequestHeaders: IdwlParams read FRequestHeaders;
+    property RequestParams: TStringList read FRequestParams;
+    property ResponseHeaders: IdwlParams read FResponseHeaders;
     property StatusCode: integer read FStatusCode write FStatusCode;
+    property Uri: string read FUri;
+    property ResponseDataStream: TMemoryStream read FResponseDataStream;
+    property TickStart: UInt64 read FTickStart;
     constructor Create(AService: TdwlTCPService); override;
     destructor Destroy; override;
     procedure ReadHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer); override;
@@ -101,6 +117,7 @@ end;
 
 procedure TdwlHTTPSocket.ClearCurrentRequest;
 begin
+  FRequestParams.Clear;
   FRequestHeaders.Clear;
   FResponseHeaders.Clear;
   if FRequestBodyStream<>nil then
@@ -108,6 +125,7 @@ begin
   if FResponseDataStream<>nil then
     FResponseDataStream.Clear;
   FState := hcsReadRequest;
+  FReadError := '';
   // No need to clear other variables, they're always overwritten during evaluation of next request
 end;
 
@@ -117,6 +135,7 @@ begin
   Assert(AService is TdwlCustomHTTPServer);
   FState := hcsReadRequest;
   FRequestHeaders := New_Params;
+  FRequestParams := TStringList.Create;
   FResponseHeaders := New_Params;
   FStatusCode := HTTP_STATUS_OK;
 end;
@@ -125,7 +144,45 @@ destructor TdwlHTTPSocket.Destroy;
 begin
   FRequestBodyStream.Free;
   FResponseDataStream.Free;
+  FRequestParams.Free;
   inherited Destroy;
+end;
+
+procedure TdwlHTTPSocket.ReadProcessURI;
+begin
+  var P := Pos('?', FUri);
+  if P>0 then
+  begin
+    var Query := Copy(FUri, p+1, MaxInt).Split(['&']);
+    FUri := Copy(FUri, 1, P-1);
+    for var Param in Query do
+    begin
+      P := pos('=', Param);
+      if P>1 then
+        RequestParams.Add(TNetEncoding.URL.Decode(Copy(Param, 1, P-1))+'='+TNetEncoding.URL.Decode(Copy(Param, P+1, MaxInt)))
+      else
+        RequestParams.Add(Param);
+    end;
+  end;
+  var ContTypeHeader := TdwlHTTPUtils.ParseHTTPFieldValue(RequestHeaders.StrValue(HTTP_FIELD_CONTENT_TYPE));
+  if SameText(ContTypeHeader.MainValue, CONTENT_TYPE_X_WWW_FORM_URLENCODED) and (FRequestBodyStream<>nil) then
+  begin
+    var WideStr: string;;
+    var CodePage := TdwlHTTPUtils.MIMEnameToCodepage(ContTypeHeader.SubValue(HTTP_SUBFIELD_CHARSET, CHARSET_UTF8));
+    var Len := RequestBodyStream.Size;
+    SetLength(WideStr, Len);
+    Len := MultiByteToWideChar(CodePage, 0, RequestBodyStream.Memory, Len, @WideStr[1], Len);
+    SetLength(WideStr, Len);
+    var Query := WideStr.Split(['&']);
+    for var Param in Query do
+    begin
+      P := pos('=', Param);
+      if P>1 then
+        RequestParams.Add(TNetEncoding.URL.Decode(Copy(Param, 1, P-1))+'='+TNetEncoding.URL.Decode(Copy(Param, P+1, MaxInt)))
+      else
+        RequestParams.Add(Param);
+    end;
+  end;
 end;
 
 procedure TdwlHTTPSocket.ReadHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer);
@@ -157,7 +214,13 @@ begin
       end;
     hcsReadRequestBody:
       begin
-        FRequestBodyStream.Write(Curr^, Eof-Curr)
+        FRequestBodyStream.Write(Curr^, Eof-Curr);
+        if FRequestBodyStream.Size>=FContentLength then
+        begin
+          FRequestBodyStream.Seek(0, soFromBeginning);
+          FState := hcsProcessing;
+        end;
+        Curr := Eof;
       end;
     hcsProcessing: ReadProcessRequest;
     hcsError,
@@ -170,7 +233,7 @@ end;
 
 procedure TdwlHTTPSocket.ReadFinishHeader;
 begin
-  var TransferEncoding := FRequestHeaders.StrValue(HTTP_HEADER_TRANSFER_ENCODING);
+  var TransferEncoding := FRequestHeaders.StrValue(HTTP_FIELD_TRANSFER_ENCODING);
   if SameText(TransferEncoding, TRANSFER_ENCODING_CHUNCKED) then
   begin
     FState := hcsError;
@@ -178,7 +241,7 @@ begin
     FReadError := 'Transfer encoding chuncked not supported';
     Exit;
   end;
-  if not FRequestHeaders.TryGetIntValue(HTTP_HEADER_CONTENT_LENGTH, FContentLength) then
+  if not FRequestHeaders.TryGetIntValue(HTTP_FIELD_CONTENT_LENGTH, FContentLength) then
     FContentLength := 0;
   if FContentLength>0 then
   begin
@@ -188,6 +251,13 @@ begin
   end
   else
     FState := hcsProcessing;
+  // Handle 100 request
+  if SameText(FRequestHeaders.StrValue(HTTP_FIELD_EXPECT), EXPECT_100_CONTINUE) then
+  begin
+    WriteLine('HTTP/1.1 100 Continue');
+    WriteLine;
+    FlushWrites;
+  end;
 end;
 
 procedure TdwlHTTPSocket.ReadPendingLine;
@@ -217,8 +287,17 @@ begin
           Exit;
         end;
       end;
-      FCommand := Parts[0];
-      FUri := TNetEncoding.URL.Decode(Parts[1]);
+      var Method := TdwlHTTPUtils.StringTodwlhttpMethod(Parts[0]);
+      if Method<0 then
+      begin
+        FState := hcsError;
+        FStatusCode := HTTP_STATUS_VERSION_NOT_SUP;
+        FReadError := 'Cannot handle method '+Parts[0];
+        Exit;
+      end
+      else
+        FRequestMethod := Method;
+      FUri := Parts[1];
       FState := hcsReadHeader;
     end;
   hcsReadHeader:
@@ -252,26 +331,31 @@ end;
 
 procedure TdwlHTTPSocket.ReadProcessRequest;
 begin
-  var KeepAlive := (FProtocol<>HTTP10) and SameText(FRequestHeaders.StrValue(HTTP_HEADER_CONNECTION), CONNECTION_KEEP_ALIVE);
+  FTickStart := GetTickCount64;
+  var KeepAlive := (FState<>hcsError) and (FProtocol<>HTTP10) and SameText(RequestHeaders.StrValue(HTTP_FIELD_CONNECTION), CONNECTION_KEEP_ALIVE);
   if FProtocol<>HTTP10 then
-    FResponseHeaders.WriteValue(HTTP_HEADER_CONNECTION, IfThen(KeepAlive, CONNECTION_KEEP_ALIVE, CONNECTION_CLOSE));
+    FResponseHeaders.WriteValue(HTTP_FIELD_CONNECTION, IfThen(KeepAlive, CONNECTION_KEEP_ALIVE, CONNECTION_CLOSE));
   if FResponseDataStream=nil then
     FResponseDataStream := TMemoryStream.Create;
   if FState=hcsError then
   begin
     if FReadError<>'' then
     begin
-      FResponseHeaders.WriteValue(HTTP_HEADER_CONTENT_TYPE, CONTENT_TYPE_HTML);
-      FResponseDataStream.WriteData('<html><body><h1>'+TNetEncoding.HTML.Encode(FReadError)+'</h1></body></html>');
+      FResponseHeaders.WriteValue(HTTP_FIELD_CONTENT_TYPE, CONTENT_TYPE_HTML);
+      var ErrStr := ansistring('<html><body><h1>'+TNetEncoding.HTML.Encode(FReadError)+'</h1></body></html>');
+      FResponseDataStream.WriteBuffer(PAnsiChar(ErrStr)^, Length(ErrStr));
     end;
   end
   else
   begin
+    // extract request parameters
+    ReadProcessURI;
+    // let the request be processed bij the server implementation
     if not TdwlCustomHTTPServer(FService).HandleRequest(Self) then
       StatusCode := HTTP_STATUS_NOT_FOUND;
   end;
-  // Remember to not write Content-Length when Command CONNECT is added later
-  FResponseHeaders.WriteValue(HTTP_HEADER_CONTENT_LENGTH, FResponseDataStream.Size.ToString);
+  // Remember to not write Content-Length when method CONNECT is added later
+  FResponseHeaders.WriteValue(HTTP_FIELD_CONTENT_LENGTH, FResponseDataStream.Size.ToString);
   // Write HTTP protocol line
   WriteStr('HTTP/1.');
   case FProtocol of
@@ -286,12 +370,14 @@ begin
   var HeaderENum := FResponseHeaders.GetEnumerator;
   while HeaderEnum.MoveNext do
     WriteLine(HeaderENum.CurrentKey+': '+HeaderENum.CurrentValue.ToString);
-  WriteLine(''); // end of headers
+  WriteLine; // end of headers
   // write body
   if FResponseDataStream.Size>0 then
     WriteBuf(PByte(FResponseDataStream.Memory), FResponseDataStream.Size);
   // finalize
   FlushWrites(not KeepAlive);
+  if Assigned(TdwlCustomHTTPServer(FService).OnLog) then
+    TdwlCustomHTTPServer(FService).OnLog(Self);
   if KeepAlive then
     ClearCurrentRequest
   else

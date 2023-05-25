@@ -1,12 +1,12 @@
 /// <summary>
 ///   Utils to cnetralize common server functionality
 /// </summary>
-unit DWL.HTTP.Server.Utils;
+unit DWL.Server.Utils;
 
 interface
 
 uses
-  DWL.HTTP.Server.Types, DWL.HTTP.Consts;
+  DWL.Server.Types, DWL.HTTP.Consts;
 
 type
   /// <summary>
@@ -22,10 +22,9 @@ type
     /// </summary>
     procedure SetContentType(const ContentType: string; const CharSet: string='');
     /// <summary>
-    ///   an easy way to set the contenttextwhen handling a request.
-    ///   Thisfunction uses the server callback function to set the
-    ///   contentbuffer/length and contenttype of the request. Note: the
-    ///   contenttext of the underlying IdHTTPServer is not used. <br />
+    ///   an easy way to set the contenttext when handling a request.
+    ///   This function uses the server callback function to set the
+    ///   contentbuffer/length and contenttype of the request.
     /// </summary>
     procedure SetContentText(const BodyStr: string; const ContentType: string=CONTENT_TYPE_HTML);
     procedure SetHeaderValue(const HeaderKey, Value: string);
@@ -34,7 +33,7 @@ type
 implementation
 
 uses
-  System.SysUtils, Winapi.Windows, DWL.HTTP.Server.Globals;
+  System.SysUtils, Winapi.Windows, DWL.Server.Globals;
 
 { TdwlHTTPHandlingStateHelper }
 
@@ -49,7 +48,7 @@ begin
   var CombinedContentType := ContentType;
   if CharSet<>'' then
     CombinedContentType := CombinedContentType+'; charset='+CharsetToWrite;
-  serverProcs.SetHeaderValueProc(@Self, HTTP_HEADER_CONTENT_TYPE, PWideChar(CombinedContentType));
+  serverProcs.SetHeaderValueProc(@Self, HTTP_FIELD_CONTENT_TYPE, PWideChar(CombinedContentType));
 end;
 
 procedure TdwlHTTPHandlingStateHelper.SetHeaderValue(const HeaderKey,Value: string);
