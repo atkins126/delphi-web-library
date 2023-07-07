@@ -636,10 +636,11 @@ implementation
 
 uses
   Winapi.Windows, System.SyncObjs, DWL.MySQL.Utils, System.Math,
-  System.SysUtils;
+  System.SysUtils, DWL.SyncObjs;
 
 const
   TIMEOUT_CONNECTION = 300000; //msecs = 5 min
+  CONNECTION_CLEANUP_INTERVAL = TIMEOUT_CONNECTION div 4;
 
 type
   TConnectionProperties = record
@@ -687,7 +688,7 @@ type
   private
     FConnectionProperties: TConnectionProperties;
     constructor Create(const AConnectionProperties: TConnectionProperties; const APassword: string; CreateDatabase, TestConnection: boolean);
-    procedure FreePassiveSessions(TimeOut, LastConnectionTimeout: cardinal);
+    procedure Cleanup;
     function GetConnection: TdwlMySQLConnection;
     procedure ReleaseConnection(Connection: TdwlMySQLConnection);
   public
@@ -729,7 +730,9 @@ type
     class var
       FAccess: TCriticalSection;
       FConnectionPools: TObjectDictionary<string, TConnectionPool>;
+      FCleanUpThread: TdwlThread;
     class function CreateSession(Params: IdwlParams): IdwlMySQLSession;
+    class procedure Cleanup;
   public
     class constructor Create;
     class destructor Destroy;
@@ -1003,21 +1006,31 @@ begin
 end;
 
 function TdwlMySQLConnection.PrepareStatement(const Query: UTF8String): PMYSQL_Stmt;
-begin
-  Result := mysql_stmt_init(FMySQL);
-  if Result=nil then
-    raise Exception.Create('Out Of Memory');
-  var ExecResult := mysql_stmt_prepare(Result, PUTF8String(Query), Length(Query));
-  // if server connection timed out, restore it....
-  if (ExecResult<>0) and (mysql_stmt_errno(Result)=CR_SERVER_GONE_ERROR) then
+  procedure InitStatement;
   begin
-    mysql_stmt_close(Result);
-    DoDisconnect;
-    DoConnect;
     Result := mysql_stmt_init(FMySQL);
     if Result=nil then
-      raise Exception.Create('Out Of Memory');
-    ExecResult := mysql_stmt_prepare(Result, PUTF8String(Query), Length(Query));
+      raise Exception.Create('mysql_stmt_init: out of memory');
+  end;
+begin
+  InitStatement;
+  var ExecResult := mysql_stmt_prepare(Result, PUTF8String(Query), Length(Query));
+  // if server connection timed out, restore it....
+  if (ExecResult<>0) then
+  begin
+    var ErrNo := mysql_stmt_errno(Result);
+    if (ErrNo=CR_SERVER_GONE_ERROR) or (ErrNo=CR_SERVER_LOST) then
+    begin
+      try
+        mysql_stmt_close(Result);
+      except
+        // this cleanup may never lead to code flow interruption
+      end;
+      DoDisconnect;
+      DoConnect;
+      InitStatement;
+      ExecResult := mysql_stmt_prepare(Result, PUTF8String(Query), Length(Query));
+    end;
   end;
   if ExecResult<>0 then
     raise Exception.Create('Failed preparing query: ' +string(Query)+#13#10+string(mysql_stmt_error(Result)));
@@ -2006,14 +2019,49 @@ end;
 
 { TdwlMySQLManager }
 
-// Connection pool cleaning is not implemented yet
-// The expectation is that the amount of connection pools will be very low
-// but if you want to make the manager perfect: go and do your job
+type
+  TManagerCleanupThread = class(TdwlThread)
+  protected
+    procedure Execute; override;
+  end;
+
+procedure TManagerCleanupThread.Execute;
+begin
+  while not Terminated do
+  begin
+    TdwlMySQLManager.Cleanup;
+    WaitForSingleObject(FWorkToDoEventHandle, CONNECTION_CLEANUP_INTERVAL);
+  end;
+end;
 
 class constructor TdwlMySQLManager.Create;
 begin
   FAccess := TCriticalSection.Create;
   FConnectionPools := TObjectDictionary<string, TConnectionPool>.Create([doOwnsValues]);
+  FCleanUpThread := TManagerCleanupThread.Create;
+end;
+
+class destructor TdwlMySQLManager.Destroy;
+begin
+  FCleanUpThread.Terminate;
+  FCleanUpThread.WaitFor;
+  FCleanUpThread.Free;
+  FConnectionPools.Free;
+  FAccess.Free;
+end;
+
+class procedure TdwlMySQLManager.Cleanup;
+begin
+  // simply cleanup all connection pools
+  var ConnPoolPairs: TArray<TPair<string, TConnectionPool>>;
+  FAccess.Enter;
+  try
+    ConnPoolPairs := FConnectionPools.ToArray;
+  finally
+    FAccess.Leave;
+  end;
+  for var ConnPair in ConnPoolPairs do
+    ConnPair.Value.Cleanup;
 end;
 
 class function TdwlMySQLManager.CreateSession(Params: IdwlParams): IdwlMySQLSession;
@@ -2036,12 +2084,6 @@ begin
     FAccess.Leave;
   end;
   Result := TdwlMySQLSession.Create(ConnectionPool);
-end;
-
-class destructor TdwlMySQLManager.Destroy;
-begin
-  FConnectionPools.Free;
-  FAccess.Free;
 end;
 
 { TdwlConnectionPool }
@@ -2073,14 +2115,15 @@ end;
 
 destructor TConnectionPool.Destroy;
 begin
-  FreePassiveSessions(0, 0);
+  for var Conn in FPassiveConnections do
+    Conn.Free;
   FActiveConnections.Free;
   FPassiveConnections.Free;
   FAccess.Free;
   inherited Destroy;
 end;
 
-procedure TConnectionPool.FreePassiveSessions(TimeOut, LastConnectionTimeout: cardinal);
+procedure TConnectionPool.Cleanup;
 begin
   FAccess.Enter;
   try
@@ -2088,7 +2131,7 @@ begin
     for var i := FPassiveConnections.Count-1 downto 0 do
     begin
       var Conn := FPassiveConnections[i];
-      if (TickNow-Conn.FBecamePassiveTick)>=IfThen(FPassiveConnections.Count=1, LastConnectionTimeout, Timeout) then
+      if (TickNow-Conn.FBecamePassiveTick)>=TIMEOUT_CONNECTION then
       begin
         FPassiveConnections.Delete(i);
         Conn.Free;
