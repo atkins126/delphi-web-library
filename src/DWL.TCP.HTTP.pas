@@ -31,6 +31,8 @@ type
     FUri: string;
     FState: TdwlHTTPServerConnectionState;
     FPendingLine: string;
+    // FRequestParams is a key/value pair list holding the requestparams
+    // please beware that the values are still URL Encoded
     FRequestParams: TStringList;
     FRequestHeaders: IdwlParams;
     FResponseHeaders: IdwlParams;
@@ -170,7 +172,7 @@ begin
       try
         P := pos('=', Param);
         if P>1 then
-          RequestParams.Add(TNetEncoding.URL.Decode(Copy(Param, 1, P-1))+'='+TNetEncoding.URL.Decode(Copy(Param, P+1, MaxInt)))
+          RequestParams.Add(TNetEncoding.URL.Decode(Copy(Param, 1, P-1))+'='+Copy(Param, P+1, MaxInt))
         else
           RequestParams.Add(TNetEncoding.URL.Decode(Param));
       except

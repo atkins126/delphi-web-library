@@ -9,13 +9,13 @@ interface
 type
   PdwlHTTPHandlingState = ^TdwlHTTPHandlingState;
 
-  TdwlHTTPWebSocket_OnData = procedure(State: PdwlHTTPHandlingState; const Data: pointer; DataSize: cardinal; DataIsText: boolean);
+  TdwlHTTPWebSocket_OnData = procedure(State: PdwlHTTPHandlingState; const Data: pointer; DataSize: cardinal; DataIsText: boolean); stdcall;
   TdwlArrangeContentBufferProc =procedure(const State: PdwlHTTPHandlingState; var ContentBuffer: pointer; const ContentLength: cardinal); stdcall;
   TdwlGetRequestParamProc = function(const State: PdwlHTTPHandlingState; const Key: PWideChar; const Value: PWideChar; var ValueCharCnt: integer): integer; stdcall;
   TdwlGetHeaderValueProc = function(const State: PdwlHTTPHandlingState; const Key: PWideChar; const Value: PWideChar; var ValueCharCnt: integer): integer; stdcall;
   TdwlGetPayloadPtrProc = function(State: PdwlHTTPHandlingState; out Data: pointer; out DataSize: Int64): boolean; stdcall;
   TdwlSetHeaderValueProc = procedure(const State: PdwlHTTPHandlingState; const HeaderKey, Value: PWideChar); stdcall;
-  TdwlActivateWebSocketProc = function(const State: PdwlHTTPHandlingState; ReceiveProc: TdwlHTTPWebSocket_OnData): TdwlHTTPWebSocket_OnData;
+  TdwlActivateWebSocketProc = function(const State: PdwlHTTPHandlingState; ReceiveProc: TdwlHTTPWebSocket_OnData): TdwlHTTPWebSocket_OnData; stdcall;
 
   /// <summary>
   ///   <para>
@@ -106,7 +106,7 @@ type
   ///   The configure proc is used to to give the DLL the possibility to configure itself
   ///   parameters are provided a key/value pairs in TStringlist.Text layout.
   /// </summary>
-  TDLL_ConfigureProc = function(const CallBackProcs: PdwlCallBackProcs; const Params: PWideChar): string; stdcall;
+  TDLL_ConfigureProc = procedure(const CallBackProcs: PdwlCallBackProcs; const Params: PWideChar); stdcall;
   /// <summary>
   ///   The wrapup proc is used to to give the DLL the possibility to clean up
   ///   resources. if state is given, the request has finished and resources like contentbuffer can be cleared
