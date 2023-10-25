@@ -4,25 +4,40 @@ interface
 
 uses
   DWL.TCP.Server, Winapi.Winsock2, System.Generics.Collections, DWL.Params,
-  System.Classes, DWL.TCP, Winapi.WinInet;
+  System.Classes, DWL.TCP, Winapi.WinInet, System.Diagnostics, DWL.SyncObjs;
 
 type
   TdwlHTTPServerConnectionState = (hcsReadRequest, hcsReadHeader, hcsReadRequestBody, hcsProcessing, hcsClosing, hcsError);
   TdwlHTTPProtocol = (HTTP10, HTTP11);
 
 type
-  TdwlHTTPSocket=class;
-  TdwlHTTPServer_OnLog=procedure(Request: TdwlHTTPSocket) of object;
+  TdwlRequestLogItem = record
+    Method:byte;
+    IP_Remote: string;
+    Port_Local: word;
+    Uri: string;
+    StatusCode: integer;
+    Duration:  Int64;
+    Headers: string;
+    Params: string;
+  end;
 
+type
+  TdwlHTTPSocket=class;
+  TdwlHTTPServer_OnLog=procedure(RequestLog: TdwlRequestLogItem) of object;
 
   TdwlCustomHTTPServer = class(TdwlTCPServer)
   strict private
-    FOnLog: TdwlHTTPServer_Onlog;
+    FRequestLogDispatchThread: TdwlThread;
+    procedure SetOnLog(const Value: TdwlHTTPServer_Onlog);
+  private
+    procedure LogRequest(Socket: TdwlHTTPSocket);
   protected
     function HandleRequest(Request: TdwlHTTPSocket): boolean; virtual;
   public
-    property OnLog: TdwlHTTPServer_Onlog read FOnLog write FOnLog;
+    property OnLog: TdwlHTTPServer_Onlog write SetOnLog;
     constructor Create;
+    destructor Destroy; override;
   end;
 
   TdwlHTTPSocket = class(TdwlSocket)
@@ -40,10 +55,11 @@ type
     FResponseDataStream: TMemoryStream;
     FContentLength: integer;
     FStatusCode: integer;
-    FTickStart: UInt64;
+    FStopWatch: TStopWatch;
     FProtocol: TdwlHTTPProtocol;
     FReadError: string;
     procedure ClearCurrentRequest;
+    function GetRequestDuration: Int64;
     procedure ReadAddToPendingLine(First, Last: PByte);
     procedure ReadFinishHeader;
     procedure ReadPendingLine;
@@ -59,8 +75,8 @@ type
     property StatusCode: integer read FStatusCode write FStatusCode;
     property Uri: string read FUri;
     property ResponseDataStream: TMemoryStream read FResponseDataStream;
-    property TickStart: UInt64 read FTickStart;
-    constructor Create(AService: TdwlTCPService); override;
+    property RequestDuration: Int64 read GetRequestDuration;
+    constructor Create(AIOHandler: IdwlTcpIOHandler); override;
     destructor Destroy; override;
     procedure ReadHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer); override;
   end;
@@ -69,7 +85,23 @@ implementation
 
 uses
   Winapi.Windows, System.SysUtils, System.NetEncoding,
-  System.StrUtils, DWL.HTTP.Utils, DWL.HTTP.Consts, DWL.Logging;
+  System.StrUtils, DWL.HTTP.Utils, DWL.HTTP.Consts, DWL.Logging,
+  System.Threading;
+
+type
+  TRequestLogDispatchThread = class(TdwlThread)
+  strict private
+    FOnLog: TdwlHTTPServer_Onlog;
+    FRequestLogs: TdwlThreadQueue<TdwlRequestLogItem>;
+    procedure DispatchRequestLogs;
+  private
+    procedure LogRequest(LogRequest: TdwlRequestLogItem);
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(OnLog: TdwlHTTPServer_OnLog);
+    destructor Destroy; override;
+  end;
 
 { TdwlCustomHTTPServer }
 
@@ -78,9 +110,53 @@ begin
   inherited Create(TdwlHTTPSocket);
 end;
 
+destructor TdwlCustomHTTPServer.Destroy;
+begin
+  if FRequestLogDispatchThread<>nil then
+    FRequestLogDispatchThread.Terminate;
+  inherited Destroy;
+end;
+
 function TdwlCustomHTTPServer.HandleRequest(Request: TdwlHTTPSocket): boolean;
 begin
   Result := false;
+end;
+
+procedure TdwlCustomHTTPServer.LogRequest(Socket: TdwlHTTPSocket);
+begin
+  if FRequestLogDispatchThread<>nil then
+  begin
+    var RequestLog: TdwlRequestLogItem;
+    RequestLog.Method := Socket.RequestMethod;
+    RequestLog.IP_Remote := Socket.Ip_Remote;
+    RequestLog.Port_Local := Socket.Port_Local;
+    RequestLog.Uri := Socket.Uri;
+    RequestLog.StatusCode := Socket.StatusCode;
+    RequestLog.Duration := Socket.RequestDuration;
+    RequestLog.Headers := Socket.RequestHeaders.GetAsNameValueText(false);
+    RequestLog.Params := '';
+    var Prms := Socket.RequestParams;
+    // clear sensitive information before logging
+    Prms.Values['password'] := '';
+    for var i := 0 to Prms.Count-1 do
+       RequestLog.Params :=  RequestLog.Params+Prms.Names[i]+'='+TNetEncoding.URL.Decode(Prms.ValueFromIndex[i])+#13#10;
+
+    TRequestLogDispatchThread(FRequestLogDispatchThread).LogRequest(RequestLog);
+  end;
+end;
+
+procedure TdwlCustomHTTPServer.SetOnLog(const Value: TdwlHTTPServer_Onlog);
+begin
+  if FRequestLogDispatchThread<>nil then
+  begin
+    FRequestLogDispatchThread.Terminate;
+    FRequestLogDispatchThread := nil;
+  end;
+  if Assigned(Value) then
+  begin
+    FRequestLogDispatchThread := TRequestLogDispatchThread.Create(Value);
+    FRequestLogDispatchThread.FreeOnTerminate := true;
+  end;
 end;
 
 { TdwlHTTPSocket }
@@ -108,7 +184,7 @@ begin
     var WideStr: string;
     var Len := Last-First+1;
     SetLength(WideStr, Len);
-    SetLength(WideStr, MultiByteToWideChar(FService.CodePage_US_ASCII, 0, PAnsiChar(First), Len, @WideStr[1], Len));
+    SetLength(WideStr, MultiByteToWideChar(FCodePage_US_ASCII, 0, PAnsiChar(First), Len, @WideStr[1], Len));
     FPendingLine := FPendingLine+WideStr;
   end;
   if Finished then
@@ -141,11 +217,12 @@ begin
   // No need to clear other variables, they're always overwritten during evaluation of next request
 end;
 
-constructor TdwlHTTPSocket.Create(AService: TdwlTCPService);
+constructor TdwlHTTPSocket.Create(AIOHandler: IdwlTcpIOHandler);
 begin
-  inherited Create(AService);
-  Assert(AService is TdwlCustomHTTPServer);
+  inherited Create(AIOHandler);
+  Assert(AIOHandler.Service is TdwlCustomHTTPServer);
   FState := hcsReadRequest;
+  FStopWatch := TStopwatch.Create;
   FRequestHeaders := New_Params;
   FRequestParams := TStringList.Create;
   FResponseHeaders := New_Params;
@@ -158,6 +235,11 @@ begin
   FResponseDataStream.Free;
   FRequestParams.Free;
   inherited Destroy;
+end;
+
+function TdwlHTTPSocket.GetRequestDuration: Int64;
+begin
+  Result := FStopWatch.ElapsedMilliseconds;
 end;
 
 procedure TdwlHTTPSocket.ReadProcessURI;
@@ -339,7 +421,8 @@ begin
   var KeepAlive: boolean;
   try
     try
-      FTickStart := GetTickCount64;
+      FStopWatch.Reset;
+      FStopWatch.Start;
       KeepAlive := (FState<>hcsError) and (FProtocol<>HTTP10) and SameText(RequestHeaders.StrValue(HTTP_FIELD_CONNECTION), CONNECTION_KEEP_ALIVE);
       if FProtocol<>HTTP10 then
         FResponseHeaders.WriteValue(HTTP_FIELD_CONNECTION, IfThen(KeepAlive, CONNECTION_KEEP_ALIVE, CONNECTION_CLOSE));
@@ -360,7 +443,7 @@ begin
       else
       begin
         // let the request be processed bij the server implementation
-        if not TdwlCustomHTTPServer(FService).HandleRequest(Self) then
+        if not TdwlCustomHTTPServer(Service).HandleRequest(Self) then
           StatusCode := HTTP_STATUS_NOT_FOUND;
       end;
       // Remember to not write Content-Length when method CONNECT is added later
@@ -387,8 +470,7 @@ begin
       FlushWrites(not KeepAlive);
     finally
       // always try to log the request
-      if Assigned(TdwlCustomHTTPServer(FService).OnLog) then
-        TdwlCustomHTTPServer(FService).OnLog(Self);
+      TdwlCustomHTTPServer(Service).LogRequest(Self);
     end;
   except
     on E: Exception do
@@ -401,6 +483,43 @@ begin
     ClearCurrentRequest
   else
     FState := hcsClosing;
+end;
+
+{ TRequestLogDispatchThread }
+
+constructor TRequestLogDispatchThread.Create(OnLog: TdwlHTTPServer_OnLog);
+begin
+  FOnLog := OnLog;
+  FRequestLogs := TdwlThreadQueue<TdwlRequestLogItem>.Create;
+  inherited Create;
+end;
+
+destructor TRequestLogDispatchThread.Destroy;
+begin
+  FRequestLogs.Free;
+  inherited Destroy;
+end;
+
+procedure TRequestLogDispatchThread.DispatchRequestLogs;
+begin
+  var RequestLog: TdwlRequestLogItem;
+  while FRequestLogs.TryPop(RequestLog) do
+    FOnLog(RequestLog);
+end;
+
+procedure TRequestLogDispatchThread.Execute;
+begin
+  while not Terminated do
+  begin
+    WaitForSingleObject(FWorkToDoEventHandle, INFINITE);
+    DispatchRequestLogs;
+  end;
+end;
+
+procedure TRequestLogDispatchThread.LogRequest(LogRequest: TdwlRequestLogItem);
+begin
+  FRequestLogs.Push(LogRequest);
+  SetEvent(FWorkToDoEventHandle);
 end;
 
 end.

@@ -21,7 +21,7 @@ type
     FRequestLoggingParams: IdwlParams;
     class procedure InsertOrUpdateDbParameter(Session: IdwlMySQLSession; const Key, Value: string);
     procedure DoLog(LogItem: PdwlLogItem);
-    procedure LogRequest(Request: TdwlHTTPSocket);
+    procedure LogRequest(LogRequest: TdwlRequestLogItem);
     function Start_InitDataBase(ConfigParams: IdwlParams): IdwlMySQLSession;
     procedure Start_ReadParameters_CommandLine_IniFile(ConfigParams: IdwlParams);
     procedure Start_ReadParameters_MySQL(Session: IdwlMySQLSession; ConfigParams: IdwlParams);
@@ -31,7 +31,8 @@ type
     procedure Start_LoadURIAliases(Session: IdwlMySQLSession);
   private
     FServer: TDWLServer;
-    class procedure CheckACMEConfiguration(Server: TdwlTCPServer; ConfigParams: IdwlParams);
+    FSSLIoHandler: IdwlSslIoHandler;
+    class procedure CheckACMEConfiguration(IOHandler: IdwlSslIoHandler; ConfigParams: IdwlParams);
   public
     procedure AfterConstruction; override;
     procedure BeforeDestruction; override;
@@ -48,7 +49,7 @@ uses
   System.Math, DWL.TCP.Consts, System.StrUtils, Winapi.Windows,
   System.Threading, DWL.Logging.Callback, Winapi.ShLwApi, DWL.Mail.Queue,
   DWL.Server.Handler.Mail, DWL.Server.Handler.DLL, Winapi.WinInet,
-  System.NetEncoding;
+  System.NetEncoding, DWL.TCP;
 
 const
   TOPIC_BOOTSTRAP = 'bootstrap';
@@ -64,6 +65,18 @@ const
   httplogLevelEverything=9;
 
   Param_LogLevel = 'loglevel'; ParamDef_LogLevel = httplogLevelWarning;
+
+type
+  TACMEChecker = class
+  strict private
+    FACMECLient: TdwlACMEClient;
+    FEnvironment: TdwlSslEnvironment;
+    procedure AlpnChallengeCallback(ChallengeActive: boolean; const HostName, Cert, Key: string);
+  public
+    property ACMEClient: TdwlACMEClient read FACMECLient;
+    constructor Create(Environment: TdwlSslEnvironment);
+    destructor Destroy; override;
+  end;
 
 type
   TACMECheckThread = class(TdwlThread)
@@ -92,7 +105,7 @@ begin
   inherited BeforeDestruction;
 end;
 
-class procedure TDWLServerSection.CheckACMEConfiguration(Server: TdwlTCPServer; ConfigParams: IdwlParams);
+class procedure TDWLServerSection.CheckACMEConfiguration(IOHandler: IdwlSslIoHandler; ConfigParams: IdwlParams);
 const
   SQL_GetHostNames =
     'SELECT HostName, Cert, PrivateKey, CountryCode, State, City, BindingIp, Id FROM dwl_hostnames';
@@ -102,12 +115,10 @@ const
     'UPDATE dwl_hostnames SET Cert=?, PrivateKey=? WHERE Id=?';
   Update_Cert_Idx_Cert=0; Update_Cert_Idx_PrivateKey=1; Update_Cert_Idx_Id=2;
 begin
-  var SslIoHandler: IdwlSslIoHandler;
   var HostNames := '';
-  if not Supports(Server.IOHandler, IdwlSslIoHandler, SslIoHandler)  then
-    SslIoHandler := nil;
-  var ACMECLient := TdwlACMEClient.Create;
+  var ACMEChecker := TACMEChecker.Create(IOHandler.Environment);
   try
+    var ACMEClient := ACMEChecker.ACMEClient;
     var AccountKey := ConfigParams.StrValue(Param_ACME_Account_Key);
     if AccountKey<>'' then
       ACMEClient.AccountPrivateKey := TdwlOpenSSL.New_PrivateKey_FromPEMStr(AccountKey);
@@ -117,14 +128,6 @@ begin
     while Cmd.Reader.Read do
     begin
       var HostName := Cmd.Reader.GetString(GetHostNames_Idx_HostName);
-      if HostNames<>'' then
-        Hostnames := HostNames+',';
-      HostNames := Hostnames+HostName;
-      if SslIoHandler=nil then // we need one!
-      begin
-        Server.IOHandler := TdwlSslIoHandler.Create;
-        SslIoHandler := Server.IOHandler as IdwlSslIoHandler;
-      end;
       ACMECLient.Domain := HostName;
       ACMECLient.ChallengeIP := Cmd.Reader.GetString(GetHostNames_Idx_BindingIp, true);
       // First Check ACME Certificate
@@ -142,38 +145,46 @@ begin
       end;
       ACMEClient.CheckCertificate;
       ACMECLient.LogCertificateStatus;
-      if ACMECLient.CertificateStatus=certstatOk then
-      begin
-        if SslIoHandler.Environment.GetContext(ACMECLient.Domain)=nil then
-          SslIoHandler.Environment.AddContext(ACMECLient.Domain, Certificate, PrivateKey);
-        Continue;
-      end;
-      // Hostname found without or with an old certificate: do a retrieve
-      ACMEClient.ProfileCountryCode := Cmd.Reader.GetString(GetHostNames_Idx_CountyCode);
-      ACMEClient.ProfileState := Cmd.Reader.GetString(GetHostNames_Idx_State);
-      ACMEClient.ProfileCity := Cmd.Reader.GetString(GetHostNames_Idx_City);
-      ACMECLient.CheckAndRetrieveCertificate;
-      if (AccountKey='') and (ACMECLient.AccountPrivateKey<>nil) then
-      begin
-        AccountKey := ACMECLient.AccountPrivateKey.PEMString;
-        InsertOrUpdateDbParameter(Session, Param_ACME_Account_Key, AccountKey);
-        ConfigParams.WriteValue(Param_ACME_Account_Key, AccountKey);
-      end;
-      if ACMEClient.CertificateStatus=certstatOk then
-      begin // process newly retrieved certificate
-        Certificate := ACMECLient.Certificate;
-        PrivateKey := ACMECLient.PrivateKey.PEMString;
-        var CmdUpdate := Session.CreateCommand(SQL_Update_Cert);
-        CmdUpdate.Parameters.SetTextDataBinding(Update_Cert_Idx_Cert, Certificate);
-        CmdUpdate.Parameters.SetTextDataBinding(Update_Cert_Idx_PrivateKey, PrivateKey);
-        CmdUpdate.Parameters.SetIntegerDataBinding(Update_Cert_Idx_Id, Cmd.Reader.GetInteger(GetHostNames_Idx_Id));
-        CmdUpdate.Execute;
+      var CertIsNew := false;
+      if ACMEClient.CertificateStatus<>certstatOk then
+      begin // Hostname found without or with an old certificate: do a retrieve
+        ACMEClient.ProfileCountryCode := Cmd.Reader.GetString(GetHostNames_Idx_CountyCode);
+        ACMEClient.ProfileState := Cmd.Reader.GetString(GetHostNames_Idx_State);
+        ACMEClient.ProfileCity := Cmd.Reader.GetString(GetHostNames_Idx_City);
+        ACMECLient.CheckAndRetrieveCertificate;
+        if (AccountKey='') and (ACMECLient.AccountPrivateKey<>nil) then
+        begin // A New accountkey was created, store it for future use
+          AccountKey := ACMECLient.AccountPrivateKey.PEMString;
+          InsertOrUpdateDbParameter(Session, Param_ACME_Account_Key, AccountKey);
+          ConfigParams.WriteValue(Param_ACME_Account_Key, AccountKey);
+        end;
+        if ACMEClient.CertificateStatus=certstatOk then
+        begin // process newly retrieved certificate
+          CertIsNew := true;
+          Certificate := ACMECLient.Certificate;
+          PrivateKey := ACMECLient.PrivateKey.PEMString;
+          var CmdUpdate := Session.CreateCommand(SQL_Update_Cert);
+          CmdUpdate.Parameters.SetTextDataBinding(Update_Cert_Idx_Cert, Certificate);
+          CmdUpdate.Parameters.SetTextDataBinding(Update_Cert_Idx_PrivateKey, PrivateKey);
+          CmdUpdate.Parameters.SetIntegerDataBinding(Update_Cert_Idx_Id, Cmd.Reader.GetInteger(GetHostNames_Idx_Id));
+          CmdUpdate.Execute;
+        end;
       end;
       if ACMEClient.CertificateStatus in [certstatAboutToExpire, certstatOk] then
-        SslIoHandler.Environment.AddContext(ACMECLient.Domain, Certificate, PrivateKey);
+      begin // Hostname can be used, so add it
+        if HostNames<>'' then
+          Hostnames := HostNames+',';
+        HostNames := Hostnames+HostName;
+        var IsNotPresent := IoHandler.Environment.GetContext(ACMECLient.Domain)=nil;
+        if CertIsNew or IsNotPresent then
+        begin
+          TdwlLogger.Log(ifThen(IsNotPresent, 'Added', 'Renewed')+' SSL context for hostname '+Hostname, lsNotice);
+          IoHandler.Environment.AddContext(ACMECLient.Domain, Certificate, PrivateKey, [ALPN_HTTP_1_1]);
+        end;
+      end;
     end;
   finally
-    ACMEClient.Free;
+    ACMEChecker.Free;
   end;
   ConfigParams.WriteValue(Param_Hostnames, HostNames);
 end;
@@ -197,7 +208,7 @@ begin
   Cmd.Execute;
 end;
 
-procedure TDWLServerSection.LogRequest(Request: TdwlHTTPSocket);
+procedure TDWLServerSection.LogRequest(LogRequest: TdwlRequestLogItem);
 const
   SQL_InsertRequest =
     'INSERT INTO dwl_log_requests (Method, StatusCode, IP_Remote, Uri, ProcessingTime, RequestHeader, RequestParams) VALUES (?,?,?,?,?,?,?)';
@@ -205,42 +216,37 @@ const
   InsertRequest_Idx_ProcessingTime=4; InsertRequest_Idx_Header=5; InsertRequest_Idx_Params=6;
 begin
   try
-    // in debugging always log everything
-    {$IFNDEF DEBUG}
+    // in debugging always log everything, except logging requests
+    {$IFDEF DEBUG}
+    if LogRequest.Uri=EndpointURI_Log then
+      Exit;
+    {$ELSE}
     if FLogLevel<httplogLevelFailedRequests then
       Exit;
     if (FLogLevel<httplogLevelAllRequests) and
-      ((Request.StatusCode=HTTP_STATUS_OK) or (Request.StatusCode=HTTP_STATUS_REDIRECT)) then
+      ((LogRequest.StatusCode=HTTP_STATUS_OK) or (LogRequest.StatusCode=HTTP_STATUS_REDIRECT)) then
       Exit;
     {$ENDIF}
-    var Ticks := GetTickCount64-Request.TickStart;
-    var RequestMethodStr := dwlhttpMethodToString[Request.RequestMethod];
+    var RequestMethodStr := dwlhttpMethodToString[LogRequest.Method];
     // in debugging log to Server Console
     {$IFDEF DEBUG}
     var LogItem := TdwlLogger.PrepareLogitem;
-    LogItem.Msg :=  Request.IP_Remote+':'+Request.Port_Local.ToString+' '+
-      RequestMethodStr+' '+Request.Uri+' '+Request.StatusCode.ToString+
-        ' ('+Ticks.ToString+'ms)';
+    LogItem.Msg :=  LogRequest.IP_Remote+':'+LogRequest.Port_Local.ToString+' '+
+      RequestMethodStr+' '+LogRequest.Uri+' '+LogRequest.StatusCode.ToString+
+        ' ('+LogRequest.Duration.ToString+'ms)';
     Logitem.Topic := 'requests';
     LogItem.SeverityLevel := lsDebug;
     LogItem.Destination := logdestinationServerConsole;
     TdwlLogger.Log(LogItem);
     {$ENDIF}
-    // log request to table
-    var Prms := Request.RequestParams;
-    var RequestParamsText: string := '';
-    // clear sensitive information before logging
-    Prms.Values['password'] := '';
-    for var i := 0 to Prms.Count-1 do
-      RequestParamsText := RequestParamsText+Prms.Names[i]+'='+TNetEncoding.URL.Decode(Prms.ValueFromIndex[i])+#13#10;
     var Cmd := New_MySQLSession(FRequestLoggingParams).CreateCommand(SQL_InsertRequest);
     Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_Method, RequestMethodStr);
-    Cmd.Parameters.SetIntegerDataBinding(InsertRequest_Idx_StatusCode, Request.StatusCode);
-    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_IP_Remote, Request.Ip_Remote);
-    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_Uri, Request.Uri);
-    Cmd.Parameters.SetIntegerDataBinding(InsertRequest_Idx_ProcessingTime, Min(High(word), Ticks));
-    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_Header, Request.RequestHeaders.GetAsNameValueText(false));
-    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_Params, RequestParamsText);
+    Cmd.Parameters.SetIntegerDataBinding(InsertRequest_Idx_StatusCode, LogRequest.StatusCode);
+    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_IP_Remote, LogRequest.Ip_Remote);
+    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_Uri, LogRequest.Uri);
+    Cmd.Parameters.SetIntegerDataBinding(InsertRequest_Idx_ProcessingTime, Min(High(word), LogRequest.Duration));
+    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_Header, LogRequest.Headers);
+    Cmd.Parameters.SetTextDataBinding(InsertRequest_Idx_Params, LogRequest.Params);
     Cmd.Execute;
   except
     on E: Exception do
@@ -259,6 +265,14 @@ const
   GetHandlerParameters_Binding_Handler_ID=0;
 begin
   try
+    // write ServerBaseURL in params for handlers to use f.e. for logging and mail sending
+    if FSSLIoHandler<>nil then
+      ConfigParams.WriteValue(Param_ServerBaseURL, 'https://'+FSSLIoHandler.Environment.MainContext.HostName)
+    else
+    begin
+      var Port := ConfigParams.StrValue(Param_Binding_Port);
+      ConfigParams.WriteValue(Param_ServerBaseURL, 'http://127.0.0.1'+IfThen(Port<>'', ':'+Port));
+    end;
     var DLLBasePath := ConfigParams.StrValue(Param_DLLBasePath, ExtractFileDir(ParamStr(0)));
     var Cmd := Session.CreateCommand(SQL_GetHandlers);
     Cmd.Execute;
@@ -374,33 +388,25 @@ begin
       Start_Enable_Logging(ConfigParams);
       TdwlLogger.Log('DWL Server starting', lsTrace, TOPIC_BOOTSTRAP);
       DWL.Server.AssignServerProcs;
-      CheckACMEConfiguration(FServer, ConfigParams);
+      FServer.OnlyLocalConnections := ConfigParams.BoolValue(Param_TestMode);
       Start_ProcessBindings(ConfigParams);
+      if FSSLIoHandler=nil then
+        TdwlLogger.Log('SERVER IS IN NON SECURE MODE!', lsWarning, TOPIC_BOOTSTRAP);
       Start_LoadURIAliases(Session);
-
-      if not FServer.IsSecure then
-      begin
-        FServer.OnlyLocalConnections := ConfigParams.BoolValue(Param_TestMode);
-        if FServer.OnlyLocalConnections then
-          TdwlLogger.Log('SERVER IS NOT SECURE, only allowing local connections', lsWarning, TOPIC_BOOTSTRAP)
-        else
-          TdwlLogger.Log('SERVER IS NOT SECURE, please configure or review ACME parameters', lsWarning, TOPIC_BOOTSTRAP);
-      end
-      else
-        FServer.OnlyLocalConnections := false;
       // Time to start the server
       FServer.Active := true;
-      TdwlLogger.Log('Enabled Server listening', lsTrace, TOPIC_BOOTSTRAP);
-      if FServer.IsSecure or FServer.OnlyLocalConnections then
+      TdwlLogger.Log('DWL Server started', lsTrace, TOPIC_BOOTSTRAP);
+      // now server is active, try to add hostnames
+      if FSSLIoHandler<>nil then
       begin
-        FServer.RegisterHandler(EndpointURI_Mail,  TdwlHTTPHandler_Mail.Create(ConfigParams));
-        Start_LoadDLLHandlers(Session, ConfigParams)
-      end
-      else
-        TdwlLogger.Log('Skipped loading of handlers because server is not secure', lsWarning, TOPIC_DLL);
+        CheckACMEConfiguration(FSSLIoHandler, ConfigParams);
+        if FSSLIoHandler.Environment.ContextCount=0 then
+          TdwlLogger.Log('WARNING: NO SSL CERTIFICATES FOUND', lsWarning, TOPIC_BOOTSTRAP);
+      end;
+      FServer.RegisterHandler(EndpointURI_Mail,  TdwlHTTPHandler_Mail.Create(ConfigParams));
+      Start_LoadDLLHandlers(Session, ConfigParams);
       FACMECheckThread := TACMECheckThread.Create(Self, ConfigParams);
       FACMECheckThread.FreeOnTerminate := true;
-      TdwlLogger.Log('DWL Server started', lsTrace, TOPIC_BOOTSTRAP);
       FServerStarted := true;
     except
       FServerStarted := false;
@@ -488,9 +494,17 @@ procedure TDWLServerSection.Start_ProcessBindings(ConfigParams: IdwlParams);
 begin
   // Apply binding information
   var BindingIP := ConfigParams.StrValue(Param_Binding_IP);
-  var BindingPort := ConfigParams.IntValue(Param_Binding_Port, IfThen(Supports(FServer.IOHandler, IdwlSslIoHandler), PORT_HTTPS, PORT_HTTP));
-  FServer.Bindings.Add(BindingIP, BindingPort);
-  TdwlLogger.Log('Bound to '+IfThen(BindingIP='', '*', BindingIP)+':'+BindingPort.ToString, lsNotice, TOPIC_BOOTSTRAP);
+  var BindingPort := ConfigParams.IntValue(Param_Binding_Port, IfThen(FServer.OnlyLocalConnections, PORT_HTTP, PORT_HTTPS));
+  var IOHandler: IdwlTCPIoHandler;
+  if FServer.OnlyLocalConnections then
+    IOHandler := TdwlPlainIoHandler.Create(FServer)
+  else
+  begin
+    FSSLIoHandler := TdwlSslIoHandler.Create(FServer);
+    IOHandler := FSSLIoHandler as IdwlTCPIoHandler;
+  end;
+  FServer.Bindings.Add(BindingIP, BindingPort, IOHandler);
+  TdwlLogger.Log('Bound to '+IfThen(BindingIP='', '*', BindingIP)+':'+BindingPort.ToString+IfThen(FServer.OnlyLocalConnections, ' (NON-SSL!!)'), lsNotice, TOPIC_BOOTSTRAP);
 end;
 
 procedure TDWLServerSection.StopServer;
@@ -505,6 +519,7 @@ begin
   TdwlLogger.UnregisterDispatcher(FCallBackLogDispatcher);
   TdwlMailQueue.Configure(nil); // to stop sending
   FServer.Bindings.Clear;
+  FSSLIoHandler := nil;
   TdwlLogger.Log('Stopped DWL Server', lsNotice, TOPIC_WRAPUP);
   TdwlLogger.FinalizeDispatching;
   FServerStarted := false;
@@ -530,12 +545,37 @@ begin
     if Terminated then
       Break;
     try
-      TDWLServerSection.CheckACMEConfiguration(FSection.FServer, FConfigParams);
+      if FSection.FSSLIoHandler<>nil then
+        TDWLServerSection.CheckACMEConfiguration(FSection.FSSLIoHandler, FConfigParams);
     except
       on E:Exception do
         TdwlLogger.Log(E, lsError, TOPIC_ACME);
     end;
   end;
+end;
+
+{ TACMEChecker }
+
+procedure TACMEChecker.AlpnChallengeCallback(ChallengeActive: boolean; const HostName, Cert, Key: string);
+begin
+  if ChallengeActive then
+    FEnvironment.AddContext(HostName, Cert, Key, [ALPN_ACME_TLS_1])
+  else
+    FEnvironment.RemoveContext(HostName);
+end;
+
+constructor TACMEChecker.Create(Environment: TdwlSslEnvironment);
+begin
+  inherited Create;
+  FEnvironment := Environment;
+  FACMECLient := TdwlACMEClient.Create;
+  FACMECLient.OnAlpnChallenge := AlpnChallengeCallback;
+end;
+
+destructor TACMEChecker.Destroy;
+begin
+  FACMECLient.Free;
+  inherited Destroy;
 end;
 
 end.

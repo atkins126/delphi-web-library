@@ -28,21 +28,29 @@ const
   TdwlTransmitBuffer = record {build with HandlingBuffer as a subpart, please leave it this way}
     Overlapped: TOverlapped;  // must be the first of the structure to be able to hand over to winsock functions as POverlapped or LPWSAOVERLAPPED
     CompletionIndicator: byte;
-    CompletionId: cardinal;
     case integer of
     0: (Socket: TdwlSocket;
         WSABuf: TWsaBuf);
     1: (HandlingBuffer: TdwlHandlingBuffer);
   end;
 
+  IdwlTCPIoHandler = interface
+    ['{B4B4EB8D-4905-4E1F-BD64-DC28995E85FF}']
+    function Service: TdwlTCPService;
+    function SizeOfSocketIoVars: cardinal;
+    procedure SocketAfterConstruction(Socket: TdwlSocket);
+    procedure SocketBeforeDestruction(Socket: TdwlSocket);
+    procedure SocketOnAccept(Socket: TdwlSocket);
+    function SocketHandleReceive(var TransmitBuffer: PdwlTransmitBuffer): boolean;
+    function SocketHandleWrite(var HandlingBuffer: PdwlHandlingBuffer): boolean;
+  end;
+
   TdwlSocketClass = class of TdwlSocket;
   TdwlSocket = class
   strict private
+    FIoHandler: IdwlTCPIoHandler;
     FSocketVars: pointer;
-    FEarlyReads: TList<PdwlTransmitBuffer>;
     FSocketHandle: TSocket;
-    FReadExpectedID: cardinal;
-    FReadLastID: cardinal;
     FWriteBuffer: PdwlHandlingBuffer;
     FWritePos: PByte;
     FWriteBufLeft: cardinal;
@@ -53,16 +61,19 @@ const
     procedure HandleCurrentWriteBuffer;
     function CheckWSAResult_ShutdownOnError(ResultCode: Integer; const LogErrorWithThisString: string=''): integer;
   private
+    FService: TdwlTCPService;
     FSocketCS: TCriticalSection;
+    FLastIoTick: UInt64;
     FShutdownTick: UInt64;
-    FTransmitBuffers: TdwlThreadList<PdwlTransmitBuffer>;
-    FHandlingBuffers: TdwlThreadList<PdwlHandlingBuffer>;
+    FTransmitBuffers: TList<PdwlTransmitBuffer>;
+    FHandlingBuffers: TList<PdwlHandlingBuffer>;
     FIp_Local: string;
     FIp_Remote: string;
     FPort_Local: word;
     FPort_Remote: word;
+    procedure IoCompleted(TransmitBuffer: PdwlTransmitBuffer; NumberOfBytesTransferred: cardinal);
   protected
-    FService: TdwlTCPService;
+    class var FCodePage_US_ASCII: integer;
     procedure CreateWriteBuffer;
   public
     property Ip_Local: string read FIp_Local;
@@ -73,11 +84,12 @@ const
     property SocketHandle: TSocket read FSocketHandle;
     property SocketVars: pointer read FSocketVars;
     property Context_HostName: string read FContext_HostName write FContext_HostName;
-    constructor Create(AService: TdwlTCPService); virtual;
+    property IOHandler: IdwlTCPIoHandler read FIoHandler;
+    class constructor Create;
+    constructor Create(IOHandler: IdwlTcpIOHandler); virtual;
     destructor Destroy; override;
     procedure ReadHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer); virtual;
     procedure FlushWrites(CloseConnection: boolean=false);
-    procedure IoCompleted(TransmitBuffer: PdwlTransmitBuffer; NumberOfBytesTransferred: cardinal);
     procedure SendTransmitBuffer(TransmitBuffer: PdwlTransmitBuffer);
     procedure Shutdown;
     procedure ShutdownDetected;
@@ -88,35 +100,21 @@ const
     procedure WriteUInt8(B: byte);
   end;
 
-  IdwlTCPIoHandler = interface
-    function SizeOfSocketIoVars: cardinal;
-    procedure SocketAfterConstruction(Socket: TdwlSocket);
-    procedure SocketBeforeDestruction(Socket: TdwlSocket);
-    procedure SocketOnAccept(Socket: TdwlSocket);
-    function SocketHandleReceive(var TransmitBuffer: PdwlTransmitBuffer): boolean;
-    function SocketHandleWrite(var HandlingBuffer: PdwlHandlingBuffer): boolean;
-  end;
-
   TdwlTCPService = class
   strict private
-    FCodePage_US_ASCII: integer;
     FActive: boolean;
-    FIoHandler: IdwlTCPIoHandler;
     procedure SetActive(const Value: boolean);
   private
+    FSocketStorage: TObject;
     FIoCompletionPort: THandle;
-    FActiveSockets: TdwlThreadList<TdwlSocket>;
-    FInActiveSockets: TdwlThreadList<TdwlSocket>;
     FIoThreads: TdwlThreadList<TThread>;
-    FCleanupThread: TdwlThread;
+    FCheckThread: TdwlThread;
   protected
     procedure InternalActivate; virtual;
     procedure InternalDeActivate; virtual;
     procedure SetSocketAddresses(Socket: TdwlSocket; const Ip_Local: string; Port_Local: word; const Ip_Remote: string; Port_Remote: word);
   public
     property Active: boolean read FActive write SetActive;
-    property CodePage_US_ASCII: integer read FCodePage_US_ASCII;
-    property IOHandler: IdwlTCPIOHandler read FIOHandler write FIOHandler;
     constructor Create;
     destructor Destroy; override;
     function AcquireHandlingBuffer(Socket: TdwlSocket): PdwlHandlingBuffer;
@@ -124,6 +122,27 @@ const
     function AcquireTransmitBuffer(HandlingBuffer: PdwlHandlingBuffer; Completionindicator: byte): PdwlTransmitBuffer; overload;
     procedure ReleaseHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer);
     procedure ReleaseTransmitBuffer(TransmitBuffer: PdwlTransmitBuffer);
+    function LockSocket(Handle: TSocket; var Socket: TdwlSocket): boolean;
+    procedure UnLockSocket(Socket: TdwlSocket);
+  end;
+
+  TdwlBaseIoHandler = class(TInterfacedObject)
+  strict private
+    FService: TdwlTCPService;
+  protected
+    function Service: TdwlTCPService;
+  public
+    constructor Create(AService: TdwlTCPService);
+  end;
+
+  TdwlPlainIoHandler = class(TdwlBaseIoHandler, IdwlTCPIoHandler)
+  strict private
+    function SizeOfSocketIoVars: cardinal;
+    procedure SocketAfterConstruction(Socket: TdwlSocket);
+    procedure SocketBeforeDestruction(Socket: TdwlSocket);
+    procedure SocketOnAccept(Socket: TdwlSocket);
+    function SocketHandleReceive(var TransmitBuffer: PdwlTransmitBuffer): boolean;
+    function SocketHandleWrite(var HandlingBuffer: PdwlHandlingBuffer): boolean;
   end;
 
 function CheckWSAResult(ResultCode: Integer; const LogErrorWithThisString: string=''): Integer; overload;
@@ -138,16 +157,16 @@ function WSASend2(s: TSocket; lpBuffers: LPWSABUF; dwBufferCount: DWORD;
 implementation
 
 uses
-  DWL.Logging, System.StrUtils, DWL.OS, System.Math, System.SysUtils;
+  DWL.Logging, DWL.OS, System.Math, System.SysUtils;
 
   // We have slightly modified the definitions from Winapi.Winsock2: NumberOfBytes now can be passed as nil (pointer instead of var)
 function WSARecv2; external 'ws2_32.dll' name 'WSARecv';
 function WSASend2; external 'ws2_32.dll' name 'WSASend';
 
 const
-  RECV_REQUEST_COUNT = 3;
-  CLEANUPTHREAD_SLEEP_MSECS = 300;
-  CLEANUP_DELAY_MSECS = 750;
+  DELETE_DELAY_MSECS = 500;
+  TIMEOUT_MSECS = 1000*60*5; // 5 min
+  TIMEOUT_CHECK_MSECS = TIMEOUT_MSECS div 3;
 
 function CheckWSAResult(ResultCode: Integer; const LogErrorWithThisString: string=''): Integer;
 begin
@@ -179,30 +198,37 @@ type
     constructor Create(AService: TdwlTCPService);
   end;
 
-  TCleanupThread = class(TdwlThread)
+  TCheckThread = class(TdwlThread)
   strict private
     FService: TdwlTCPService;
+    FNextTimeOutCheck: UInt64;
   protected
     procedure Execute; override;
   public
     constructor Create(AService: TdwlTCPService);
   end;
 
-  TPlainIoHandler = class(TInterfacedObject, IdwlTCPIoHandler)
+  TdwlSocketStorage = class
   strict private
-    function SizeOfSocketIoVars: cardinal;
-    procedure SocketAfterConstruction(Socket: TdwlSocket);
-    procedure SocketBeforeDestruction(Socket: TdwlSocket);
-    procedure SocketOnAccept(Socket: TdwlSocket);
-    function SocketHandleReceive(var TransmitBuffer: PdwlTransmitBuffer): boolean;
-    function SocketHandleWrite(var HandlingBuffer: PdwlHandlingBuffer): boolean;
+    FListAccess: TCriticalSection;
+    FSockets: TDictionary<TSocket, TdwlSocket>;
+    FSockets2Delete: TList<TdwlSocket>;
+  private
+    procedure DoDeleteCheck;
+    procedure DoTimeOutCheck;
+    procedure RegisterNewSocket(Socket: TdwlSocket);
+    function LockSocket(Handle: TSocket; var Socket: TdwlSocket): boolean;
+    procedure UnLockSocket(Socket: TdwlSocket);
+  public
+    constructor Create;
+    destructor Destroy; override;
   end;
 
 { TdwlSocket }
 
 procedure TdwlSocket.HandleCurrentWriteBuffer;
 begin
-  if not fService.IoHandler.SocketHandleWrite(FWriteBuffer) then
+  if not FIoHandler.SocketHandleWrite(FWriteBuffer) then
     Shutdown;
   if FWriteBuffer<>nil then
     FService.ReleaseHandlingBuffer(FWriteBuffer);
@@ -211,42 +237,26 @@ end;
 procedure TdwlSocket.SendTransmitBuffer(TransmitBuffer: PdwlTransmitBuffer);
 begin
   var Res := CheckWSAResult_ShutdownOnError(WSASend2(SocketHandle, @TransmitBuffer.WSABuf, 1, nil, 0, LPWSAOVERLAPPED(TransmitBuffer), nil));
-  if (Res<>0) and (Res<>WSAECONNRESET) and (Res<>WSAEWOULDBLOCK) and (Res<>integer(WSA_IO_PENDING)) and (Res<>integer(WSA_IO_INCOMPLETE)) then
+  if (Res<>0) and (Res<>WSAECONNRESET) and (Res<>WSAECONNABORTED) and (Res<>WSAEWOULDBLOCK) and (Res<>integer(WSA_IO_PENDING)) and (Res<>integer(WSA_IO_INCOMPLETE)) then
     TdwlLogger.Log('Winsock error: '+SysErrorMessage(Res)+' ('+Res.ToString+') in SendTransmitBuffer', lsError);
-  AtomicIncrement(FWritesInProgress);
+  inc(FWritesInProgress);
 end;
 
 procedure TdwlSocket.Shutdown;
 begin
   Winapi.Winsock2.shutdown(FSocketHandle, SD_BOTH);
-  ShutdownDetected;
 end;
 
 procedure TdwlSocket.ShutdownDetected;
 begin
-  if FShutdownTick<>0 then
-    Exit;
-  FShutdownTick := GetTickCount64;
-  if FService.FActiveSockets.Contains(Self) then
-  begin // no need for extra thread protection, this is only done once and already done within SocketCS Lock.
-    FService.FActiveSockets.Remove(Self);
-    FService.FInActiveSockets.Add(Self);
-  end;
+  if FShutdownTick=0 then
+    FShutdownTick := GetTickCount64;
 end;
 
 procedure TdwlSocket.StartReceiving;
 begin
-  FSocketCS.Enter;
-  try
-    FReadLastId := 0;
-    FReadExpectedID := 1;
-    for var i := 1 to RECV_REQUEST_COUNT do
-      CreateRecvRequest;
-    // if using getpeername, getsockname, getsockopt, or setsockopt enable the next line
-    // setsockopt(Overlapped.Socket.SocketHandle, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, <>, sizeof(SOCKET));
-  finally
-    FSocketCS.Leave;
-  end;
+  FLastIoTick := GetTickCount64;
+  CreateRecvRequest;
 end;
 
 procedure TdwlSocket.WriteBuf(Buf: PByte; Size: integer);
@@ -283,7 +293,7 @@ begin
   var StrAnsi: ansistring;
   var Len := Str.Length;
   SetLength(StrAnsi, Len);
-  SetLength(StrAnsi, WideCharToMultiByte(FService.CodePage_US_ASCII, 0, PWideChar(Str), Len, PAnsiChar(StrAnsi), Len, nil, nil));
+  SetLength(StrAnsi, WideCharToMultiByte(FCodePage_US_ASCII, 0, PWideChar(Str), Len, PAnsiChar(StrAnsi), Len, nil, nil));
   WriteBuf(PByte(PAnsiChar(StrAnsi)), Len);
 end;
 
@@ -296,37 +306,45 @@ function TdwlSocket.CheckWSAResult_ShutdownOnError(ResultCode: Integer; const Lo
 begin
   Result := CheckWSAResult(ResultCode, LogErrorWithThisString);
   if (Result<>0) and (Result<>WSA_IO_PENDING) then
-    ShutDown;
+    ShutdownDetected;
 end;
 
-constructor TdwlSocket.Create(AService: TdwlTCPService);
+constructor TdwlSocket.Create(IOHandler: IdwlTcpIOHandler);
 begin
   inherited Create;
-  FTransmitBuffers := TdwlThreadList<PdwlTransmitBuffer>.Create;
-  FHandlingBuffers := TdwlThreadList<PdwlHandlingBuffer>.Create;
-  FService := AService;
-  FService.FActiveSockets.Add(Self);
+  FTransmitBuffers := TList<PdwlTransmitBuffer>.Create;
+  FHandlingBuffers := TList<PdwlHandlingBuffer>.Create;
+  FIoHandler := IOHandler;
+  FService := FIoHandler.Service;
   FSocketCS := TCriticalSection.Create;
-  FEarlyReads := TList<PdwlTransmitBuffer>.Create;
-  var SocketVarsSize := FService.IOHandler.SizeOfSocketIoVars;
+  FSocketHandle := WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, nil, 0, WSA_FLAG_OVERLAPPED);
+  var SocketVarsSize := FIOHandler.SizeOfSocketIoVars;
   if SocketVarsSize>0 then
     GetMem(FSocketVars, SocketVarsSize);
-  FService.IOHandler.SocketAfterConstruction(Self);
-  FSocketHandle := WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, nil, 0, WSA_FLAG_OVERLAPPED);
+  FIOHandler.SocketAfterConstruction(Self);
+  TdwlSocketStorage(FService.FSocketStorage).RegisterNewSocket(Self);
   //and attach to IoCompletionPort
-	if CreateIoCompletionPort(SocketHandle, FService.FIoCompletionPort, 0, 0)=0 then
+	if CreateIoCompletionPort(SocketHandle, FService.FIoCompletionPort, SocketHandle, 0)=0 then
     CheckWSAResult_ShutdownOnError(-1, 'CreateIoCompletionPort');
   CreateWriteBuffer;
+end;
+
+class constructor TdwlSocket.Create;
+begin
+  // get the available most basic codepage
+  var Dummy: TCPInfo;
+  if GetCPInfo(20127, Dummy) then
+    FCodePage_US_ASCII := 20127
+  else
+    FCodePage_US_ASCII := 437;
 end;
 
 procedure TdwlSocket.CreateRecvRequest;
 begin
   var TransmitBuffer := FService.AcquireTransmitBuffer(Self, COMPLETIONINDICATOR_READ);
-  Inc(FReadLastID);
-  TransmitBuffer.CompletionId := FReadLastID;
   var EmptyFlags: cardinal := 0;
   var Res:= CheckWSAResult_ShutdownOnError(WSARecv2(SocketHandle, @TransmitBuffer.WSABuf, 1, nil, EmptyFlags, LPWSAOVERLAPPED(TransmitBuffer), nil));
-  if (Res<>0) and (Res<>WSAECONNRESET) and (Res<>WSAEWOULDBLOCK) and (Res<>integer(WSA_IO_PENDING)) and (Res<>integer(WSA_IO_INCOMPLETE)) then
+  if (Res<>0) and (Res<>WSAECONNRESET) and (Res<>WSAECONNABORTED) and (Res<>WSAEWOULDBLOCK) and (Res<>integer(WSA_IO_PENDING)) and (Res<>integer(WSA_IO_INCOMPLETE)) then
     TdwlLogger.Log('Winsock error: '+SysErrorMessage(Res)+' ('+Res.ToString+') in CreateRecvRequest', lsError);
 end;
 
@@ -339,24 +357,19 @@ end;
 
 destructor TdwlSocket.Destroy;
 begin
-  FSocketCS.Enter;
-  FService.IOHandler.SocketBeforeDestruction(Self);
+  FIOHandler.SocketBeforeDestruction(Self);
   if FSocketVars<>nil then
     FreeMem(FSocketVars);
   closesocket(FSocketHandle);
-  FService.FInActiveSockets.Remove(Self);
-  FEarlyReads.Free;
   // release buffers never sent to or returned from IoCompletion
-  var LeftOverTransmitBuf: PdwlTransmitBuffer;
-  while FTransmitBuffers.TryPop(LeftOverTransmitBuf) do
-    FService.ReleaseTransmitBuffer(LeftOverTransmitBuf);
+  while FTransmitBuffers.Count>0 do
+    FService.ReleaseTransmitBuffer(FTransmitBuffers[0]);
   FTransmitBuffers.Free;
-  var LeftOverhandlingBuf: PdwlHandlingBuffer;
-  while FHandlingBuffers.TryPop(LeftOverhandlingBuf) do
-    FService.ReleaseHandlingBuffer(LeftOverhandlingBuf);
+  while FHandlingBuffers.Count>0  do
+    FService.ReleaseHandlingBuffer(FHandlingBuffers[0]);
   FHandlingBuffers.Free;
-  inherited Destroy;
   FSocketCS.Free;
+  inherited Destroy;
 end;
 
 procedure TdwlSocket.ReadHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer);
@@ -380,69 +393,30 @@ begin
   begin
     if CloseConnection then
     begin
-      // post a completion status for shutdown of socket (this is needed because order of iocompletion is no always as expected)
-      AtomicIncrement(FWritesInProgress);
+      // post a completion status for shutdown of socket (this is needed because order of iocompletion is not always as expected)
+      inc(FWritesInProgress);
       var TransmitBuffer := FService.AcquireTransmitBuffer(Self, COMPLETIONINDICATOR_WRITE);
-      PostQueuedCompletionStatus(FService.FIoCompletionPort, 0, 0, POverlapped(TransmitBuffer));
+      PostQueuedCompletionStatus(FService.FIoCompletionPort, 0, SocketHandle, POverlapped(TransmitBuffer));
       FWriteBuffer := nil; // do not create a new one, we're finished
     end;
   end;
 end;
 
 procedure TdwlSocket.IoCompleted(TransmitBuffer: PdwlTransmitBuffer; NumberOfBytesTransferred: cardinal);
-  procedure CheckEarlyReads;
-  begin
-    var NoneFound: boolean;
-    repeat
-      NoneFound := true;
-      for var i := 0 to FEarlyReads.Count-1 do
-      begin
-        if FEarlyReads[i].CompletionId=FReadExpectedID then
-        begin
-          NoneFound :=  false;
-          var EarlyTransmit := FEarlyReads[i];
-          FEarlyReads.Delete(i);
-          if not FService.IOHandler.SocketHandleReceive(EarlyTransmit) then
-            Shutdown;
-          if EarlyTransmit<>nil then // could be set to nil if IOHandler took over, f.e. for a delayed handling
-            FService.ReleaseTransmitBuffer(EarlyTransmit);
-          inc(FReadExpectedID);
-          Break;
-        end;
-      end;
-    until NoneFound;
-  end;
 begin
-  FSocketCS.Enter;
-  try
-    case TransmitBuffer.CompletionIndicator of
-    COMPLETIONINDICATOR_READ:
-      begin
-        CreateRecvRequest; // create a new receive request
-        // set WSAbuf.len to actual used length
-        TransmitBuffer.WSABuf.len := NumberOfBytesTransferred;
-        // handle the finished request;
-        CheckEarlyReads;
-        if TransmitBuffer.CompletionId<>FReadExpectedID then
-          FEarlyReads.Add(TransmitBuffer) // add current to early reads
-        else
-        begin
-          if not FService.IOHandler.SocketHandleReceive(TransmitBuffer) then
-            Shutdown;
-          if TransmitBuffer<>nil then // could be set to nil if IOHandler took over, f.e. for a delayed handling
-            FService.ReleaseTransmitBuffer(TransmitBuffer);
-          inc(FReadExpectedID);
-          CheckEarlyReads;
-        end;
-      end;
-    COMPLETIONINDICATOR_WRITE:
-      begin
-        FService.ReleaseTransmitBuffer(TransmitBuffer);
-        AtomicDecrement(FWritesInProgress);
-      end;
+  FLastIoTick := GetTickCount64;
+  case TransmitBuffer.CompletionIndicator of
+  COMPLETIONINDICATOR_READ:
+    begin
+      // set WSAbuf.len to actual used length
+      TransmitBuffer.WSABuf.len := NumberOfBytesTransferred;
+      // handle the finished request;
+      if not FIOHandler.SocketHandleReceive(TransmitBuffer) then
+        Shutdown;
+      CreateRecvRequest; // create a new receive request
     end;
-  finally
-    FSocketCS.Leave;
+  COMPLETIONINDICATOR_WRITE:
+      dec(FWritesInProgress);
   end;
   if FCloseConnection and (FWritesInProgress=0) then
     Shutdown;
@@ -479,21 +453,11 @@ begin
   // startup winsock
   var WSAData: TWSAData;
   CheckWSAResult(WSAStartup(WINSOCK_VERSION, WSAData), 'WSAStartup');
-  FActiveSockets := TdwlThreadList<TdwlSocket>.Create;
-  FInActiveSockets := TdwlThreadList<TdwlSocket>.Create;
-  var Dummy: TCPInfo;
-  // get the available most basic codepage
-  if GetCPInfo(20127, Dummy) then
-    FCodePage_US_ASCII := 20127
-  else
-    FCodePage_US_ASCII := 437;
 end;
 
 destructor TdwlTCPService.Destroy;
 begin
   Active := false;
-  FActiveSockets.Free;
-  FInActiveSockets.Free;
   // cleanup winsock
   CheckWSAResult(WSACleanup, 'WSACleanup');
   FIoThreads.Free;
@@ -502,21 +466,21 @@ end;
 
 procedure TdwlTCPService.InternalActivate;
 begin
-  if IOHandler=nil then
-    IOHandler := TPlainIOHandler.Create;
+  FSocketStorage := TdwlSocketStorage.Create;
   // Create IoCompletionPort
-	FIoCompletionPort := CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
+  var NumberOfThreads := Min(3, TdwlOS.NumberOfLogicalProcessors);
+	FIoCompletionPort := CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, NumberOfThreads);
   // Create IoThreads
-  for var i := 1 to TdwlOS.NumberOfLogicalProcessors do
+  for var i := 1 to NumberOfThreads do
     TIOThread.Create(Self);
-  FCleanupThread := TCleanupThread.Create(Self);
-  FCleanupThread.FreeOnTerminate := true;
+  FCheckThread := TCheckThread.Create(Self);
+  FCheckThread.FreeOnTerminate := true;
 end;
 
 procedure TdwlTCPService.InternalDeActivate;
 begin
   // stop cleanup thread
-  FCleanupThread.Terminate;  // It's Free on terminate
+  FCheckThread.Terminate;  // It's Free on terminate
   // stop running threads and wait for them
   var RunningThreads := FIoThreads.LockList;
   try
@@ -532,14 +496,14 @@ begin
   // wait untill all IoThreads are finshed
   while FIoThreads.Count>0 do
     Sleep(100);
-  // close all sockets
-  var Socket: TdwlSocket;
-  while FActiveSockets.TryPop(Socket) do
-    Socket.Free;
-  while FInActiveSockets.TryPop(Socket) do
-    Socket.Free;
+  FSocketStorage.Free;
   // Close IoCompletionPort
   CloseHandle(FIoCompletionPort);
+end;
+
+function TdwlTCPService.LockSocket(Handle: TSocket; var Socket: TdwlSocket): boolean;
+begin
+  Result := TdwlSocketStorage(FSocketStorage).LockSocket(Handle, Socket);
 end;
 
 procedure TdwlTCPService.ReleaseHandlingBuffer(HandlingBuffer: PdwlHandlingBuffer);
@@ -551,6 +515,7 @@ end;
 
 procedure TdwlTCPService.ReleaseTransmitBuffer(TransmitBuffer: PdwlTransmitBuffer);
 begin
+  Assert(TransmitBuffer.Socket.FTransmitBuffers.Contains(TransmitBuffer));
   TransmitBuffer.Socket.FTransmitBuffers.Remove(TransmitBuffer);
   FreeMem(TransmitBuffer.WSABuf.buf);
   FreeMem(TransmitBuffer);
@@ -584,6 +549,11 @@ begin
   Socket.FPort_Remote := Port_Remote;
 end;
 
+procedure TdwlTCPService.UnLockSocket(Socket: TdwlSocket);
+begin
+  TdwlSocketStorage(FSocketStorage).UnLockSocket(Socket);
+end;
+
 { TIoThread }
 
 constructor TIoThread.Create(AService: TdwlTCPService);
@@ -600,18 +570,25 @@ begin
   begin
     try
       var NumberOfBytesTransferred: cardinal;
-      var CompletionKey: NativeUInt;
+      var SocketHandle: THandle;
       var TransmitBuffer: PdwlTransmitBuffer;
-      if not GetQueuedCompletionStatus(FService.FIoCompletionPort, NumberOfBytesTransferred, CompletionKey, POverlapped(TransmitBuffer), INFINITE) then
+      // GetQueueCompletionsStatus never times out so no need to check result
+      if not GetQueuedCompletionStatus(FService.FIoCompletionPort, NumberOfBytesTransferred, SocketHandle, POverlapped(TransmitBuffer), INFINITE) then
         Continue;
-      if TransmitBuffer=nil then
+      if TransmitBuffer=nil then  // my own post to 'activate' the IOThread on termination
         Continue;
-      if NumberOfBytesTransferred>0 then
-        TransmitBuffer.Socket.IoCompleted(TransmitBuffer, NumberOfBytesTransferred)
-      else
-      begin
-        TransmitBuffer.Socket.ShutdownDetected;
+      var Socket: TdwlSocket;
+      if not FService.LockSocket(SocketHandle, Socket) then
+        Continue;
+      try
+        Assert(TransmitBuffer.Socket.SocketHandle=SocketHandle);
+        if NumberOfBytesTransferred>0 then
+          Socket.IoCompleted(TransmitBuffer, NumberOfBytesTransferred)
+        else
+          Socket.ShutdownDetected;
         FService.ReleaseTransmitBuffer(TransmitBuffer);
+      finally
+        FService.UnLockSocket(Socket);
       end;
     except
       on E: Exception do
@@ -623,69 +600,186 @@ end;
 
 { TCleanupThread }
 
-constructor TCleanupThread.Create(AService: TdwlTCPService);
+constructor TCheckThread.Create(AService: TdwlTCPService);
 begin
   FService := AService;
   inherited Create;
 end;
 
-procedure TCleanupThread.Execute;
+procedure TCheckThread.Execute;
 begin
   while not Terminated do
   begin
     try
-      WaitForSingleObject(FWorkToDoEventHandle, CLEANUPTHREAD_SLEEP_MSECS);
-      var Socket: TdwlSocket;
-      var DeleteMoment := GetTickCount64-CLEANUP_DELAY_MSECS;
-      while FService.FInActiveSockets.TryPop(Socket) do
+      WaitForSingleObject(FWorkToDoEventHandle, DELETE_DELAY_MSECS);
+      TdwlSocketStorage(FService.FSocketStorage).DoDeleteCheck;
+      var TickNow := GetTickCount64;
+      if TickNow>FNextTimeOutCheck then
       begin
-        if (Socket.FShutdownTick>0) and (Socket.FShutdownTick<DeleteMoment) then
-          Socket.Free
-        else
-        begin
-          FService.FInActiveSockets.Insert(0, Socket); // maybe next time
-          Break;
-        end;
+        FNextTimeOutCheck := TickNow+TIMEOUT_CHECK_MSECS;
+        TdwlSocketStorage(FService.FSocketStorage).DoTimeOutCheck;
       end;
     except
     end;
   end;
 end;
 
-{ TPlainIoHandler }
+{ TdwlPlainIoHandler }
 
-function TPlainIoHandler.SizeOfSocketIoVars: cardinal;
+function TdwlPlainIoHandler.SizeOfSocketIoVars: cardinal;
 begin
   Result := 0;
 end;
 
-procedure TPlainIoHandler.SocketAfterConstruction(Socket: TdwlSocket);
+procedure TdwlPlainIoHandler.SocketAfterConstruction(Socket: TdwlSocket);
 begin
   // no usage here
 end;
 
-procedure TPlainIoHandler.SocketBeforeDestruction(Socket: TdwlSocket);
+procedure TdwlPlainIoHandler.SocketBeforeDestruction(Socket: TdwlSocket);
 begin
   // no usage here
 end;
 
-procedure TPlainIoHandler.SocketOnAccept(Socket: TdwlSocket);
+procedure TdwlPlainIoHandler.SocketOnAccept(Socket: TdwlSocket);
 begin
   // no usage here
 end;
 
-function TPlainIoHandler.SocketHandleReceive(var TransmitBuffer: PdwlTransmitBuffer): boolean;
+function TdwlPlainIoHandler.SocketHandleReceive(var TransmitBuffer: PdwlTransmitBuffer): boolean;
 begin
   TransmitBuffer.Socket.ReadHandlingBuffer(@TransmitBuffer.HandlingBuffer);
   Result := true;
 end;
 
-function TPlainIoHandler.SocketHandleWrite(var HandlingBuffer: PdwlHandlingBuffer): boolean;
+function TdwlPlainIoHandler.SocketHandleWrite(var HandlingBuffer: PdwlHandlingBuffer): boolean;
 begin
   var TransmitBuffer := HandlingBuffer.Socket.FService.AcquireTransmitBuffer(HandlingBuffer, COMPLETIONINDICATOR_WRITE);
   HandlingBuffer := nil; // to signal we took it
   TransmitBuffer.Socket.SendTransmitBuffer(TransmitBuffer);
   Result := true;
+end;
+
+{ TdwlSocketStorage }
+
+constructor TdwlSocketStorage.Create;
+begin
+  inherited Create;
+  FListAccess := TCriticalSection.Create;
+  FSockets := TDictionary<TSocket, TdwlSocket>.Create;
+  FSockets2Delete := TList<TdwlSocket>.Create;
+end;
+
+destructor TdwlSocketStorage.Destroy;
+begin
+  var SockArray := FSockets.ToArray;
+  for var Sock in SockArray do
+    Sock.Value.Free;
+  for var Sock in FSockets2Delete do
+    Sock.Free;
+  FSockets.Free;
+  FSockets2Delete.Free;
+  FListAccess.Free;
+  inherited Destroy;
+end;
+
+procedure TdwlSocketStorage.DoDeleteCheck;
+begin
+  var Socket2Free: TdwlSocket;
+  var NowTick := GetTickCount64;
+  repeat
+    FListAccess.Enter;
+    try
+      if FSockets2Delete.Count=0 then
+        Break;
+      Socket2Free := FSockets2Delete[0];
+      if Socket2Free.FShutdownTick+DELETE_DELAY_MSECS<NowTick then
+        FSockets2Delete.Delete(0)
+      else
+        Break; // not yet (also the later added ones are skipped)
+    finally
+      FListAccess.Leave;
+    end;
+    Socket2Free.Free;
+  until true;
+end;
+
+procedure TdwlSocketStorage.DoTimeOutCheck;
+begin
+  var Handles2Check: TArray<TSocket>;
+  FListAccess.Enter;
+  try
+    Handles2Check := FSockets.Keys.ToArray;
+  finally
+    FListAccess.Leave;
+  end;
+  var NowTick := GetTickCount64;
+  for var Handle2Check in Handles2Check do
+  begin
+    var Socket: TdwlSocket;
+    if LockSocket(Handle2Check, Socket) then
+    try
+      if (Socket.FLastIoTick>0 {not a listen socket}) and (Socket.FLastIoTick+TIMEOUT_MSECS<NowTick) then
+        Socket.FShutdownTick := 1; // to signal it must be deleted in the unlock
+    finally
+      UnLockSocket(Socket);
+    end;
+  end;
+end;
+
+function TdwlSocketStorage.LockSocket(Handle: TSocket; var Socket: TdwlSocket): boolean;
+begin
+  FListAccess.Enter;
+  try
+    Result := FSockets.TryGetValue(Handle, Socket);
+  finally
+    FListAccess.Leave;
+  end;
+  if Result then
+    Socket.FSocketCS.Enter;
+end;
+
+procedure TdwlSocketStorage.RegisterNewSocket(Socket: TdwlSocket);
+begin
+  FListAccess.Enter;
+  try
+    FSockets.Add(Socket.SocketHandle, Socket);
+  finally
+    FListAccess.Leave;
+  end;
+end;
+
+procedure TdwlSocketStorage.UnLockSocket(Socket: TdwlSocket);
+begin
+  if Socket.FShutdownTick>0 then
+  begin
+    // socket has shut down, remove it from the list and queue for deletion
+    // to simplify Locking/unlocking, we do a delayed delete
+    FListAccess.Enter;
+    try
+      if FSockets.ContainsKey(Socket.SocketHandle) then
+      begin
+        FSockets.Remove(Socket.SocketHandle);
+        Socket.FShutdownTick := GetTickCount64;
+        FSockets2Delete.Add(Socket);
+      end;
+    finally
+      FListAccess.Leave;
+    end;
+  end;
+  Socket.FSocketCS.Leave;;
+end;
+
+{ TdwlBaseIoHandler }
+
+constructor TdwlBaseIoHandler.Create(AService: TdwlTCPService);
+begin
+  FService := AService;
+end;
+
+function TdwlBaseIoHandler.Service: TdwlTCPService;
+begin
+  Result := FService;
 end;
 
 end.

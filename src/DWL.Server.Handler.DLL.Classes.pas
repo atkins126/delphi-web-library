@@ -32,7 +32,7 @@ type
     class var
       FHandlingEndpoints: TObjectDictionary<string, THandlingEndpoints_Dictionary>;
       FEndpoint: string;
-      FMainHostName: string;
+      FServerBaseURL: string;
     class procedure ProcessOptions(const State: PdwlHTTPHandlingState; var Success: boolean; Cmds: THandlingEndpoints_Dictionary);
     class function Body_JSON(const State: PdwlHTTPHandlingState): TJSONObject;
   private
@@ -42,7 +42,7 @@ type
       FConfigParams: IdwlParams;
       FCallBackProcs: TdwlCallBackProcs;
     class procedure RegisterHandling(const Method: byte; const URI: string; const handleProc: TEndpoint_HandleProc; const AllowedScopes: TArray<string>; Params: IdwlParams=nil);
-    class function MainHostName: string;
+    class function ServerBaseURL: string;
     class function Request_Issuer(const State: PdwlHTTPHandlingState): string;
     class function StateParams(const State: PdwlHTTPHandlingState): IdwlParams;
     class function ScopeOverlap(const State: PdwlHTTPHandlingState; const Scopes: TArray<string>): boolean; overload;
@@ -120,7 +120,7 @@ type
     /// <summary>
     ///   try get a request param as datetime
     /// </summary>
-    class function TryGetRequestParamDateTime(const State: PdwlHTTPHandlingState; const Key: string; var Value: TDateTime; AddJSONErrorOnFailure: boolean=false; const NewStatusCodeOnError: word=HTTP_STATUS_BAD_REQUEST): boolean;
+    class function TryGetRequestParamDateTime(const State: PdwlHTTPHandlingState; const Key: string; var Value: TDateTime; ReturnUTC: boolean=true; AddJSONErrorOnFailure: boolean=false; const NewStatusCodeOnError: word=HTTP_STATUS_BAD_REQUEST): boolean;
     /// <summary>
     ///   Gets the pointer to the payload. You can consume binary post data by
     ///   using this pointer. Please note, you're not the owner of this memory,
@@ -205,14 +205,8 @@ begin
   FConfigParams := New_Params;
   FConfigParams.WriteNameValueText(Params);
   FEndpoint := FConfigParams.StrValue(Param_Endpoint);
-  FMainHostName := FConfigParams.StrValue(Param_Hostnames);
-  var P := pos(',', FMainHostName);
-  if P>0 then
-    FMainHostName := Copy(FMainHostName, 1, P-1);
-  if FMainHostName='' then  {localhost test mode}
-    EnableLogDispatchingToAPI('http://localhost'+EndpointURI_Log, FConfigParams.StrValue(Param_LogSecret))
-  else
-    EnableLogDispatchingToAPI('https://'+MainHostName+EndpointURI_Log, FConfigParams.StrValue(Param_LogSecret));
+  FServerBaseURL := FConfigParams.StrValue(Param_ServerBaseURL);
+  EnableLogDispatchingToAPI(FServerBaseURL+EndpointURI_Log, FConfigParams.StrValue(Param_LogSecret))
 end;
 
 class procedure TdwlDLLHandling.ProcessOptions(const State: PdwlHTTPHandlingState; var Success: boolean; Cmds: THandlingEndpoints_Dictionary);
@@ -350,13 +344,13 @@ begin
     JSON_AddError(State, 99, 'invalid or missing parameter '+Key, NewStatusCodeOnError);
 end;
 
-class function TdwlDLLHandling.TryGetRequestParamDateTime(const State: PdwlHTTPHandlingState; const Key: string; var Value: TDateTime; AddJSONErrorOnFailure: boolean; const NewStatusCodeOnError: word): boolean;
+class function TdwlDLLHandling.TryGetRequestParamDateTime(const State: PdwlHTTPHandlingState; const Key: string; var Value: TDateTime; ReturnUTC: boolean=true; AddJSONErrorOnFailure: boolean=false; const NewStatusCodeOnError: word=HTTP_STATUS_BAD_REQUEST): boolean;
 begin
   try
     var StrVal: string;
     Result := State.TryGetRequestParamStr(Key, StrVal);
     if Result then
-      Value := ISO8601ToDate(StrVal);
+      Value := ISO8601ToDate(StrVal, ReturnUTC);
   except
     Result := false;
   end;
@@ -486,9 +480,9 @@ begin
     Response_JSON(State).AddPair('success', TJSONBool.Create(IsSuccess));
 end;
 
-class function TdwlDLLHandling.MainHostName: string;
+class function TdwlDLLHandling.ServerBaseURL: string;
 begin
-  Result := FMainHostName;
+  Result := FServerBaseURL;
 end;
 
 class function TdwlDLLHandling.MySQLCommand(const State: PdwlHTTPHandlingState; const Query: string): IdwlMySQLCommand;
