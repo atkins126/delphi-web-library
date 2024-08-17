@@ -3,10 +3,13 @@ unit DWL.Params;
 interface
 
 uses
-  System.Rtti, System.Generics.Collections, DWL.Resolver, System.JSON;
+  System.Rtti, System.Generics.Collections, DWL.Resolver, System.JSON,
+  System.TypInfo, DWL.Types;
 
 type
   IdwlParams=interface;
+
+  TParamTryCalculateProc = function(Params: IdwlParams; const LowerKey: string; var Value: TValue): boolean;
 
   /// <summary>
   ///   Definition of callback procedure that will be used to signal changes
@@ -23,6 +26,31 @@ type
     function CurrentKey: string;
     function CurrentValue: TValue;
     function MoveNext: boolean;
+  end;
+
+  TProvideKeyCallBack = procedure(const LowerKey: string; const Value: TValue) of object;
+
+  TdwlCheckResult = record
+    Success: boolean;
+    ErrorMessage: string;
+  end;
+
+  IdwlParamsPersistHook = interface
+    procedure AddOrSetValue(const LowerKey: string; const Value: TValue);
+    procedure Clear;
+    procedure ClearKey(const LowerKey: string);
+    function ContainsKey(const LowerKey: string): boolean;
+    function TryGetValue(const LowerKey: string; var Value: TValue): boolean;
+    procedure ProvideUnknownKeys(const KnownKeys: TArray<string>);
+    procedure Initialize(ProvideProc: TProvideKeyCallBack);
+  end;
+
+  IdwlMetaKeyConsulter = interface
+    function DefaultValue: TValue;
+    function Prettyname: string;
+    function TypeInfo: PTypeInfo;
+    function MinimumValue: TValue;
+    function MaximumValue: TValue;
   end;
 
   /// <summary>
@@ -51,7 +79,7 @@ type
     /// <param name="Keys">
     ///   The keys of the key/value pairs that will be copied to the Params
     /// </param>
-    procedure AssignTo(Params: IdwlParams; Keys: TArray<string>); overload;
+    procedure AssignKeysTo(Params: IdwlParams; Keys: TArray<string>); overload;
     /// <summary>
     ///   With AddTrigger you can add a one-shot trigger to be fired. Once the
     ///   TriggerKey is changed (or cleared) the DependentKey will
@@ -71,6 +99,17 @@ type
     ///   The Params that will receive the key/value pairs
     /// </param>
     procedure AssignTo(Params: IdwlParams); overload;
+    /// <summary>
+    ///   Copy all key/value pairs in the store to another store
+    ///   but skip the calculated fields! (asdefined in the metadata)
+    /// </summary>
+    /// <param name="Params">
+    ///   The Params that will receive the key/value pairs
+    /// </param>
+    /// <param name="ExlcudeKeyss">
+    ///   These keys will be skipped and not assigned
+    /// </param>
+    procedure AssignTo(Params: IdwlParams; ExcludeKeys: TArray<string>); overload;
     /// <summary>
     ///   Get the value of the pair, if needed converted to the boolean type
     /// </summary>
@@ -167,12 +206,30 @@ type
     /// </remarks>
     function StrValue(const Key: string; const Default: string=''): string;
     /// <summary>
+    ///   Get the value of the pair, if needed converted to the UnixEpoch type
+    /// </summary>
+    /// <param name="Key">
+    ///   The key of the pair
+    /// </param>
+    /// <param name="Default">
+    ///   default to be returned when the pair does not exist
+    /// </param>
+    /// <remarks>
+    ///   Please note that: <br />- metakeys will be applied with higher
+    ///   priority <br />- values will be resolved using TdwlResolver
+    ///   functionality <br />
+    ///   Please note that: The property Default is an Int64 to make it possible to give it a default value
+    ///   EmptyEpoch is not allowed as default value by teh compiler
+    /// </remarks>
+    function UnixEpochValue(const Key: string; const Default: Int64=0): TUnixEpoch;
+    /// <summary>
     ///   function to check of a pair with the give key existst in the store
     /// </summary>
     /// <param name="Key">
     ///   Key to check
     /// </param>
     function ContainsKey(const Key: string): boolean;
+    function CheckValue(const Key: string; const Value: TValue): TdwlCheckResult;
     /// <summary>
     ///   TryGetBareValue is the faster, but simple retrieval function of
     ///   values by key, NO meta data lookup, resolving etc is done in this
@@ -284,6 +341,63 @@ type
     /// </remarks>
     function TryGetStrValue(const Key: string; out Value: string): boolean;
     /// <summary>
+    ///   Try to get the value of the pair, if needed converted to the TUnixEpoch
+    ///   type
+    /// </summary>
+    /// <param name="Key">
+    ///   the key of the pair to be returned
+    /// </param>
+    /// <param name="Value">
+    ///   will receive the retrieved value
+    /// </param>
+    /// <returns>
+    ///   indicating if the retrieval was successful
+    /// </returns>
+    /// <remarks>
+    ///   Please note that: <br />- if applicable metakeys will be applied and
+    ///   the retrieval will be successful <br />- textual values will be
+    ///   resolved using TdwlResolver functionality
+    /// </remarks>
+    function TryGetUnixEpochValue(const Key: string; out Value: TUnixEpoch): boolean;
+    /// <summary>
+    ///   Try to get the value of the pair, if needed converted to the double
+    ///   type
+    /// </summary>
+    /// <param name="Key">
+    ///   the key of the pair to be returned
+    /// </param>
+    /// <param name="Value">
+    ///   will receive the retrieved value
+    /// </param>
+    /// <returns>
+    ///   indicating if the retrieval was successful
+    /// </returns>
+    /// <remarks>
+    ///   Please note that: <br />- if applicable metakeys will be applied and
+    ///   the retrieval will be successful <br />- textual values will be
+    ///   resolved using TdwlResolver functionality
+    /// </remarks>
+    function TryGetDoubleValue(const Key: string; out Value: double): boolean;
+    /// <summary>
+    ///   Try to get the value of the pair, if needed converted to the double
+    ///   type
+    /// </summary>
+    /// <param name="Key">
+    ///   the key of the pair to be returned
+    /// </param>
+    /// <param name="Value">
+    ///   will receive the retrieved value
+    /// </param>
+    /// <returns>
+    ///   indicating if the retrieval was successful
+    /// </returns>
+    /// <remarks>
+    ///   Please note that: <br />- if applicable metakeys will be applied and
+    ///   the retrieval will be successful <br />- textual values will be
+    ///   resolved using TdwlResolver functionality
+    /// </remarks>
+    function TryGetBoolValue(const Key: string; out Value: boolean): boolean;
+    /// <summary>
     ///   GetBareValue is the faster, but simple retrieval function of values
     ///   by key, NO meta data lookup, resolving etc is done in this function
     /// </summary>
@@ -319,12 +433,16 @@ type
     /// <param name="Value">
     ///   the value of the pair
     /// </param>
+    /// <param name="SkipPersisting">
+    ///   default false, if persisting is skipped, the value is not forwarded
+    ///   to the persisting handler
+    /// </param>
     /// <remarks>
     ///   A very important paradigm is that keys are always enforced to be
     ///   lowercase (No matter how you feed them into the function) This is to
     ///   guarantee a uniform case-insensitive resolving and reading of keys <br />
     /// </remarks>
-    procedure WriteValue(const Key: string; const Value: TValue);
+    procedure WriteValue(const Key: string; const Value: TValue; SkipPersisting: boolean=false);
     /// <summary>
     ///   put the presented keys in the form of Name Value pairs (as f.e. used
     ///   in TStringList) into the store'
@@ -386,8 +504,11 @@ type
     /// <param name="CallBackProc">
     ///   The procedure to be called in the case of changes
     /// </param>
-    procedure EnableChangeTracking(CallBackProc: TChangeMethodCallBackProc); overload;
-    procedure EnableChangeTracking(CallBackProc: TChangeRegularCallBackProc); overload;
+    procedure EnableChangeTracking(CallBackProc: TChangeMethodCallBackProc; FRestrictToConfiguredMetaKeys: boolean=false); overload;
+    procedure EnableChangeTracking(CallBackProc: TChangeRegularCallBackProc; FRestrictToConfiguredMetaKeys: boolean=false); overload;
+    procedure RegisterPersistHook(PersistHook: IdwlParamsPersistHook);
+    procedure UnRegisterPersistHook;
+    function MetaKeyConsulter(const Key: string): IdwlMetaKeyConsulter;
   end;
 
   /// <summary>
@@ -397,6 +518,16 @@ type
     Key: string;
     Value: TValue;
     constructor Create(const AKey: string; const AValue: TValue);
+  end;
+
+  IdwlMetaKeyBuilder = interface
+    function CalculateProc(CalculateProc: TParamTryCalculateProc): IdwlMetaKeyBuilder;
+    function ChangeTracking(const ChangeTrackingEnabled: boolean): IdwlMetaKeyBuilder;
+    function DefaultValue(DefaultValue: TValue): IdwlMetaKeyBuilder;
+    function MaximumValue(MaximumValue: TValue): IdwlMetaKeyBuilder;
+    function MinimumValue(MinimumValue: TValue): IdwlMetaKeyBuilder;
+    function PrettyName(const Prettyname: string): IdwlMetaKeyBuilder;
+    function WriteDefaultValue: IdwlMetaKeyBuilder;
   end;
 
 /// <summary>
@@ -457,23 +588,32 @@ function New_Params(ParamPairs: array of TdwlParamPair): IdwlParams; overload;
 ///     a IdwlParams instance in a multithreaded context
 ///   </para>
 /// </remarks>
-procedure AddGlobalMetaKey(const Domain, Key: string; Default: TValue);
-
+function AddParamsMetaKey(const Domain, Key: string; TypeInfo: PTypeInfo): IdwlMetaKeyBuilder;
 
 implementation
 
 uses
   System.SysUtils, System.Generics.Defaults,
-  System.TypInfo, System.Classes, DWL.Rtti.Utils, DWL.ConvUtils,
+  System.Classes, DWL.Rtti.Utils, DWL.ConvUtils,
   System.NetEncoding;
 
 type
   TdwlMetaKey = class
-  strict private
-    FDefault: TValue;
+  private
+    FCalculators: TList<TParamTryCalculateProc>;
+    FChangeTracking: boolean;
+    FTypeInfo: PTypeInfo;
+    FDefaultValue: TValue;
+    FMaximumValue: TValue;
+    FMinimumValue: TValue;
+    FWriteDefaultValue: boolean;
+    FPrettyName: string;
+    procedure Check(Value: TValue);
+    procedure RegisterCalculateProc(CalcProc: TParamTryCalculateProc);
+    function TryCalculateValue(Params: IdwlParams; const LowerKey: string; var Value: TValue): boolean;
   public
-    property Default: TValue read FDefault;
-    constructor Create(ADefault: TValue);
+    constructor Create(TypeInfo: PTypeInfo);
+    destructor Destroy; override;
   end;
 
   TdwlParamsEnumerator = class(TInterfacedObject, IdwlParamsEnumerator)
@@ -490,12 +630,18 @@ type
 
   TdwlParams = class(TInterfacedObject, IdwlParams)
   strict private
+    FPersistHook: IdwlParamsPersistHook;
+    FRequestedAllFromPersistHook: boolean;
+    procedure ProvideKeyCallBack(const LowerKey: string; const Value: TValue);
+    function TryGetFromPersistHook(const LowerKey: string; var Value: TValue): boolean;
+    function TryGetMetaKey(const LowerKey: string; out MetaKey: TdwlMetaKey): boolean;
   class var
     FMetaKeys: TObjectDictionary<string, TdwlMetaKey>;
   var
     FParams: TDictionary<string, TValue>;
     FTriggers: TList<TPair<string, string>>;
     FDomain: string;
+    FChangeCallBacksRestrictedToConfiguredMetaKeys: boolean;
     FChangeMethodCallbackProc: TChangeMethodCallBackProc;
     FChangeRegularCallbackProc: TChangeRegularCallBackProc;
     class function DictKey(const Domain, Key: string): string;
@@ -504,29 +650,33 @@ type
     function IntValue(const Key: string; Default: integer=0): integer;
     function Int64Value(const Key: string; Default: Int64=0): Int64;
     function StrValue(const Key: string; const Default: string=''): string;
+    function UnixEpochValue(const Key: string; const Default: Int64=0): TUnixEpoch;
     function DoubleValue(const Key: string; Default: double=0): double;
     function GetBareValue(const Key: string; Default: TValue): TValue;
     function GetValue(const Key: string; Default: TValue): TValue;
     function TryGetBareValue(const Key: string; out Value: TValue): boolean;
     function TryGetValue(const Key: string; out Value: TValue): boolean; overload;
-    function TryGetValue<T>(const Key: string; out Value: T): boolean; overload;
     function TryGetByteValue(const Key: string; out Value: byte): boolean;
     function TryGetIntValue(const Key: string; out Value: integer): boolean;
     function TryGetInt64Value(const Key: string; out Value: Int64): boolean;
     function TryGetCardinalValue(const Key: string; out Value: cardinal): boolean;
     function TryGetStrValue(const Key: string; out Value: string): boolean;
+    function TryGetUnixEpochValue(const Key: string; out Value: TUnixEpoch): boolean;
     function TryGetDoubleValue(const Key: string; out Value: double): boolean;
+    function TryGetBoolValue(const Key: string; out Value: boolean): boolean;
     procedure AddTrigger(const TriggerKey, DependentKey: string);
     function Clone: IdwlParams;
     procedure ExecuteTriggers(const TriggerKey: string);
     procedure Resolve(var Str: string);
-    procedure EnableChangeTracking(CallBackProc: TChangeMethodCallBackProc); overload;
-    procedure EnableChangeTracking(CallBackProc: TChangeRegularCallBackProc); overload;
-    procedure WriteValue(const Key: string; const Value: TValue);
+    procedure EnableChangeTracking(CallBackProc: TChangeMethodCallBackProc; FRestrictToConfiguredMetaKeys: boolean=false); overload;
+    procedure EnableChangeTracking(CallBackProc: TChangeRegularCallBackProc; FRestrictToConfiguredMetaKeys: boolean=false); overload;
+    function CheckValue(const Key: string; const Value: TValue): TdwlCheckResult;
+    procedure WriteValue(const Key: string; const Value: TValue; SkipPersisting: boolean=false);
     procedure ClearKey(const Key: string);
     function ContainsKey(const Key: string): boolean;
-    procedure AssignTo(Params: IdwlParams; Keys: TArray<string>); overload;
+    procedure AssignKeysTo(Params: IdwlParams; Keys: TArray<string>);
     procedure AssignTo(Params: IdwlParams); overload;
+    procedure AssignTo(Params: IdwlParams; ExcludeKeys: TArray<string>); overload;
     function GetAsNameValueText(UrlEncodeValues: boolean=true): string;
     procedure PutIntoJSONObject(JSONObject: TJSONObject);
     function GetEnumerator: IdwlParamsEnumerator;
@@ -534,12 +684,44 @@ type
     procedure WriteJSON(const JSON: string); overload;
     procedure WriteJSON(const JSON: TJSONObject); overload;
     procedure Clear;
+    procedure RegisterPersistHook(PersistHook: IdwlParamsPersistHook);
+    procedure UnRegisterPersistHook;
+    function MetaKeyConsulter(const Key: string): IdwlMetaKeyConsulter;
   public
     class constructor Create;
     class destructor Destroy;
-    class procedure AddMetaKey(const Domain, Key: string; Default: TValue);
+    class function AddMetaKey(const Domain, Key: string; TypeInfo: PTypeInfo): TdwlMetaKey;
     constructor Create(const Domain: string);
     destructor Destroy; override;
+  end;
+
+  TdwlMetakeyBuilder = class(TInterfacedObject, IdwlMetaKeyBuilder)
+  strict private
+    FMetaKey: TdwlMetaKey;
+  private
+    function CalculateProc(CalculateProc: TParamTryCalculateProc): IdwlMetaKeyBuilder;
+    function ChangeTracking(const ChangeTrackingEnabled: boolean): IdwlMetaKeyBuilder;
+    function DefaultValue(DefaultValue: TValue): IdwlMetaKeyBuilder;
+    function MaximumValue(MaximumValue: TValue): IdwlMetaKeyBuilder;
+    function MinimumValue(MinimumValue: TValue): IdwlMetaKeyBuilder;
+    function WriteDefaultValue: IdwlMetaKeyBuilder;
+    function Prettyname(const PrettyName: string): IdwlMetaKeyBuilder;
+  public
+    constructor Create(MetaKey: TdwlMetaKey);
+  end;
+
+  TdwlMetakeyConsulter = class(TInterfacedObject, IdwlMetaKeyConsulter)
+  strict private
+    FKey: string;
+    FMetaKey: TdwlMetaKey;
+  private
+    function DefaultValue: TValue;
+    function Prettyname: string;
+    function TypeInfo: PTypeInfo;
+    function MinimumValue: TValue;
+    function MaximumValue: TValue;
+  public
+    constructor Create(const Key: string; MetaKey: TdwlMetaKey);
   end;
 
 function New_Params(const Domain: string): IdwlParams;
@@ -560,16 +742,20 @@ begin
   Result.WriteValue(Key, Value);
 end;
 
-procedure AddGlobalMetaKey(const Domain, Key: string; Default: TValue);
+function AddParamsMetaKey(const Domain, Key: string; TypeInfo: PTypeInfo): IdwlMetaKeyBuilder;
 begin
-  TdwlParams.AddMetaKey(Domain, Key, Default);
+  Result := TdwlMetakeyBuilder.Create(TdwlParams.AddMetaKey(Domain, Key, TypeInfo));
 end;
 
 { TdwlParams }
 
-class procedure TdwlParams.AddMetaKey(const Domain, Key: string; Default: TValue);
+class function TdwlParams.AddMetaKey(const Domain, Key: string; TypeInfo: PTypeInfo): TdwlMetaKey;
 begin
-  FMetaKeys.Add(DictKey(Domain.ToLower, Key.ToLower), TdwlMetaKey.Create(Default));
+  if not FMetaKeys.TryGetValue(DictKey(Domain.ToLower, Key.ToLower), Result) then
+  begin
+    Result := TdwlMetaKey.Create(TypeInfo);
+    FMetaKeys.Add(DictKey(Domain.ToLower, Key.ToLower), Result);
+  end;
 end;
 
 procedure TdwlParams.AddTrigger(const TriggerKey, DependentKey: string);
@@ -579,74 +765,167 @@ begin
   // elsewhere in the object to check if triggering is active
   if FTriggers=nil then
     FTriggers := TList<TPair<string, string>>.Create;
-  FTriggers.Add(TPair<string, string>.Create(TriggerKey.ToLower, DependentKey.ToLower));
+  var Pair := TPair<string, string>.Create(TriggerKey.ToLower, DependentKey.ToLower);
+  if not FTriggers.Contains(Pair) then
+    FTriggers.Add(Pair);
 end;
 
 procedure TdwlParams.AssignTo(Params: IdwlParams);
 begin
-  var Enumerator := FParams.GetEnumerator;
-  try
-    while Enumerator.MoveNext do
-      Params.WriteValue(Enumerator.Current.Key, Enumerator.Current.Value);
-  finally
-    Enumerator.Free;
+  var Enumerator := GetEnumerator;
+  while Enumerator.MoveNext do
+  begin
+      // don't assign calculated values
+      var MetaKey: TdwlMetaKey;
+      if TryGetMetaKey(Enumerator.CurrentKey, MetaKey) and (MetaKey.FCalculators<>nil) then
+        Continue;
+    Params.WriteValue(Enumerator.CurrentKey, Enumerator.CurrentValue);
   end;
 end;
 
-procedure TdwlParams.AssignTo(Params: IdwlParams; Keys: TArray<string>);
+procedure TdwlParams.AssignKeysTo(Params: IdwlParams; Keys: TArray<string>);
 begin
   var V: TValue;
   for var Key in Keys do
+  begin
+    // don't assign calculated values
+    var MetaKey: TdwlMetaKey;
+    if TryGetMetaKey(Key, MetaKey) and (MetaKey.FCalculators<>nil) then
+      Continue;
     if TryGetValue(Key, V) then
       Params.WriteValue(Key, V);
+  end;
+end;
+
+procedure TdwlParams.AssignTo(Params: IdwlParams; ExcludeKeys: TArray<string>);
+begin
+  var ExclList := TStringList.Create;
+  try
+    for var ExclKey in ExcludeKeys do
+      ExclList.Add(ExclKey.ToLower);
+    ExclList.Sort;
+    var Enumerator := GetEnumerator;
+    while Enumerator.MoveNext do
+    begin
+      if ExclList.IndexOf(Enumerator.CurrentKey)>=0 then
+        Continue;
+      // don't assign calculated values
+      var MetaKey: TdwlMetaKey;
+      if TryGetMetaKey(Enumerator.CurrentKey, MetaKey) and (MetaKey.FCalculators<>nil) then
+        Continue;
+      Params.WriteValue(Enumerator.CurrentKey, Enumerator.CurrentValue);
+    end;
+  finally
+    ExclList.Free;
+  end;
 end;
 
 function TdwlParams.GetAsNameValueText(UrlEncodeValues: boolean=true): string;
 begin
   Result := '';
-  var Enumerator := FParams.GetEnumerator;
-  try
-    if UrlEncodeValues then
-    begin
-      while Enumerator.MoveNext do
-        Result := Result+Enumerator.Current.Key+'='+TNetEncoding.URL.Encode(Enumerator.Current.Value.ToString)+#13#10;
-    end
-    else
-    begin
-      while Enumerator.MoveNext do
-        Result := Result+Enumerator.Current.Key+'='+Enumerator.Current.Value.ToString+#13#10;
-    end;
-  finally
-    Enumerator.Free;
+  var Enumerator := GetEnumerator;
+  if UrlEncodeValues then
+  begin
+    while Enumerator.MoveNext do
+      Result := Result+Enumerator.CurrentKey+'='+TNetEncoding.URL.Encode(Enumerator.CurrentValue.ToString)+#13#10;
+  end
+  else
+  begin
+    while Enumerator.MoveNext do
+      Result := Result+Enumerator.CurrentKey+'='+Enumerator.CurrentValue.ToString+#13#10;
   end;
 end;
 
-function TdwlParams.BoolValue(const Key: string; Default: boolean): boolean;
+function TdwlParams.BoolValue(const Key: string; Default: boolean=false): boolean;
 begin
-  var Value: TValue;
- if (not TryGetValue(Key, Value)) or (not TryStrToBool(Value.ToString, Result)) then
+  if not TryGetBoolValue(Key, Result) then
     Result := Default;
 end;
 
-function TdwlParams.CardinalValue(const Key: string;Default: cardinal): cardinal;
+function TdwlParams.CardinalValue(const Key: string;Default: cardinal=0): cardinal;
 begin
   if not TryGetCardinalValue(Key, Result) then
     Result := Default;
 end;
 
+function TdwlParams.CheckValue(const Key: string; const Value: TValue): TdwlCheckResult;
+  function CheckMinValue(ValA, ValB: TValue): boolean;
+  begin
+    if ValA.IsEmpty then
+      Exit(true);
+    case ValA.Kind of
+    tkInteger: Result := ValA.AsInteger<=valB.AsInteger;
+    tkFloat: Result := ValA.AsExtended<=valB.AsExtended;
+    tkString: Result := ValA.AsString<=valB.AsString;
+    else
+      Result := false;
+    end;
+  end;
+  function CheckMaxValue(ValA, ValB: TValue): boolean;
+  begin
+    if ValA.IsEmpty then
+      Exit(true);
+    case ValA.Kind of
+    tkInteger: Result := ValA.AsInteger>=valB.AsInteger;
+    tkFloat: Result := ValA.AsExtended>=valB.AsExtended;
+    tkString: Result := ValA.AsString>=valB.AsString;
+    else
+      Result := false;
+    end;
+  end;
+
+begin
+  Result.Success := false;
+  try
+    var MetaKey: TdwlMetaKey;
+    if not TryGetMetaKey(Key.ToLower, MetaKey) then
+    begin
+      Result.ErrorMessage := 'unable to check: no metadata found ';
+      Exit;
+    end;
+    if not CheckMinValue(MetaKey.FMinimumValue, Value) then
+    begin
+      Result.ErrorMessage := 'value is below '+MetaKey.FMinimumValue.ToString;
+      Exit;
+    end;
+    if not CheckMaxValue(MetaKey.FMaximumValue, Value) then
+    begin
+      Result.ErrorMessage := 'value is above '+MetaKey.FMaximumValue.ToString;
+      Exit;
+    end;
+    Result.Success := true;
+  except
+    on E: Exception do
+    Result.ErrorMessage := E.Message;
+  end;
+end;
+
 procedure TdwlParams.Clear;
 begin
   FParams.Clear;
+  if Assigned(FPersistHook) then
+    FPersistHook.Clear;
 end;
 
 procedure TdwlParams.ClearKey(const Key: string);
 begin
   var LowerKey := Key.ToLower;
+  if not ContainsKey(LowerKey) then
+    Exit;
   FParams.Remove(LowerKey);
-  if Assigned(FChangeMethodCallbackProc) then
-    FChangeMethodCallbackProc(Self, Key, TValue.Empty);
-  if Assigned(FChangeRegularCallbackProc) then
-    FChangeRegularCallbackProc(Self, Key, TValue.Empty);
+  if Assigned(FPersistHook) then
+    FPersistHook.ClearKey(LowerKey);
+  if Assigned(FChangeMethodCallbackProc) or Assigned(FChangeRegularCallbackProc) then
+  begin
+    var MetaKey: TdwlMetaKey;
+    if (not FChangeCallBacksRestrictedToConfiguredMetaKeys) or (TryGetMetaKey(Key, MetaKey) and MetaKey.FChangeTracking) then
+    begin
+      if Assigned(FChangeMethodCallbackProc) then
+        FChangeMethodCallbackProc(Self, Key, TValue.Empty);
+      if Assigned(FChangeRegularCallbackProc) then
+        FChangeRegularCallbackProc(Self, Key, TValue.Empty);
+    end;
+  end;
   ExecuteTriggers(LowerKey);
 end;
 
@@ -663,7 +942,12 @@ end;
 
 function TdwlParams.ContainsKey(const Key: string): boolean;
 begin
-  Result := FParams.ContainsKey(Key.ToLower);
+  var LowerKey := Key.ToLower;
+  Result := FParams.ContainsKey(LowerKey);
+  if (not Result) and (FPersistHook<>nil) then
+  begin
+    Result := FPersistHook.ContainsKey(LowerKey);
+  end;
 end;
 
 class constructor TdwlParams.Create;
@@ -697,19 +981,21 @@ begin
   Result := '#'+Domain+'#'+Key;
 end;
 
-function TdwlParams.DoubleValue(const Key: string; Default: double): double;
+function TdwlParams.DoubleValue(const Key: string; Default: double=0): double;
 begin
   if not TryGetDoubleValue(Key, Result) then
     Result := Default
 end;
 
-procedure TdwlParams.EnableChangeTracking(CallBackProc: TChangeMethodCallBackProc);
+procedure TdwlParams.EnableChangeTracking(CallBackProc: TChangeMethodCallBackProc; FRestrictToConfiguredMetaKeys: boolean=false);
 begin
+  FChangeCallBacksRestrictedToConfiguredMetaKeys := FRestrictToConfiguredMetaKeys;
   FChangeMethodCallbackProc := CallBackProc;
 end;
 
-procedure TdwlParams.EnableChangeTracking(CallBackProc: TChangeRegularCallBackProc);
+procedure TdwlParams.EnableChangeTracking(CallBackProc: TChangeRegularCallBackProc; FRestrictToConfiguredMetaKeys: boolean=false);
 begin
+  FChangeCallBacksRestrictedToConfiguredMetaKeys := FRestrictToConfiguredMetaKeys;
   FChangeRegularCallbackProc := CallBackProc;
 end;
 
@@ -738,44 +1024,72 @@ end;
 
 function TdwlParams.GetEnumerator: IdwlParamsEnumerator;
 begin
+  if (FPersistHook<>nil) and (not FRequestedAllFromPersistHook) then
+  begin
+    var KnownKeys := FParams.Keys.ToArray;
+    FPersistHook.ProvideUnknownKeys(KnownKeys);
+    FRequestedAllFromPersistHook := true;
+  end;
   Result := TdwlParamsEnumerator.Create(FParams.GetEnumerator);
 end;
 
-function TdwlParams.Int64Value(const Key: string; Default: Int64): Int64;
+function TdwlParams.TryGetMetaKey(const LowerKey: string; out MetaKey: TdwlMetaKey): boolean;
+begin
+  Result := (FDomain<>'') and FMetaKeys.TryGetValue(DictKey(FDomain, LowerKey), MetaKey);
+end;
+
+function TdwlParams.Int64Value(const Key: string; Default: Int64=0): Int64;
 begin
   if not TryGetInt64Value(Key, Result) then
     Result := Default
 end;
 
-function TdwlParams.IntValue(const Key: string; Default: integer): integer;
+function TdwlParams.IntValue(const Key: string; Default: integer=0): integer;
 begin
   if not TryGetIntValue(Key, Result) then
     Result := Default
 end;
 
+function TdwlParams.MetaKeyConsulter(const Key: string): IdwlMetaKeyConsulter;
+begin
+  var LowerKey := Key.ToLower;
+  var MetaKey: TdwlMetaKey;
+  if not TryGetMetaKey(LowerKey, MetaKey) then
+    MetaKey := nil;
+  Result := TdwlMetakeyConsulter.Create(Key, MetaKey);
+end;
+
+procedure TdwlParams.ProvideKeyCallBack(const LowerKey: string; const Value: TValue);
+begin
+  FParams.Add(LowerKey, Value);
+end;
+
 procedure TdwlParams.PutIntoJSONObject(JSONObject: TJSONObject);
 begin
-  var Enumerator := FParams.GetEnumerator;
-  try
-    while Enumerator.MoveNext do
-    begin
-      var Value := Enumerator.Current.Value;
-      case Value.Kind of
-      tkChar,
-      tkWChar,
-      tkUString,
-      tkWString,
-      tkString: JSONObject.AddPair(Enumerator.Current.Key, Value.ToString);
-      tkInteger: JSONObject.AddPair(Enumerator.Current.Key, Value.AsInteger);
-      tkInt64: JSONObject.AddPair(Enumerator.Current.Key, Value.AsInt64);
-      tkFloat: JSONObject.AddPair(Enumerator.Current.Key, Value.AsExtended);
-      else
-        raise Exception.Create('TValue: Unknown kind in PutIntoJSONObject');
-      end;
+  var Enumerator := GetEnumerator;
+  while Enumerator.MoveNext do
+  begin
+    var Value := Enumerator.CurrentValue;
+    case Value.Kind of
+    tkChar,
+    tkWChar,
+    tkUString,
+    tkWString,
+    tkString: JSONObject.AddPair(Enumerator.CurrentKey, Value.ToString);
+    tkInteger: JSONObject.AddPair(Enumerator.CurrentKey, Value.AsInteger);
+    tkInt64: JSONObject.AddPair(Enumerator.CurrentKey, Value.AsInt64);
+    tkFloat: JSONObject.AddPair(Enumerator.CurrentKey, Value.AsExtended);
+    else
+      raise Exception.Create('TValue: Unknown kind in PutIntoJSONObject');
     end;
-  finally
-    Enumerator.Free;
   end;
+end;
+
+procedure TdwlParams.RegisterPersistHook(PersistHook: IdwlParamsPersistHook);
+begin
+  FPersistHook := PersistHook;
+  FRequestedAllFromPersistHook := false;
+  FPersistHook.Initialize(ProvideKeyCallBack);
 end;
 
 procedure TdwlParams.Resolve(var Str: string);
@@ -811,7 +1125,7 @@ begin
   end;
 end;
 
-function TdwlParams.StrValue(const Key: string; const Default: string): string;
+function TdwlParams.StrValue(const Key: string; const Default: string=''): string;
 begin
   if not TryGetStrValue(Key, Result) then
     Result := Default;
@@ -819,12 +1133,37 @@ end;
 
 function TdwlParams.TryGetBareValue(const Key: string; out Value: TValue): boolean;
 begin
-  Result := FParams.TryGetValue(Key.ToLower, Value);
+  var LowerKey := Key.ToLower;
+  Result := FParams.TryGetValue(LowerKey, Value);
+  if not Result then
+    Result := TryGetFromPersistHook(LowerKey, Value);
+end;
+
+function TdwlParams.TryGetBoolValue(const Key: string; out Value: boolean): boolean;
+begin
+  var V: TValue;
+  Result := TryGetValue(Key, V);
+  if not Result then
+    Exit;
+  Result := V.TryAsType(Value, false);
+  if not Result then
+    Result := TryStrToBool(V.ToString, Value);
 end;
 
 function TdwlParams.TryGetByteValue(const Key: string; out Value: byte): boolean;
 begin
-  Result := TryGetValue<byte>(Key, Value);
+  var V: TValue;
+  Result := TryGetValue(Key, V);
+  if not Result then
+    Exit;
+  Result := V.TryAsType(Value, false);
+  if not Result then
+  begin
+    var C: cardinal;
+    Result := TryStrToUInt(V.ToString, C) and (C<256);
+    if Result then
+      Value := C;
+  end;
 end;
 
 function TdwlParams.TryGetCardinalValue(const Key: string; out Value: cardinal): boolean;
@@ -850,6 +1189,13 @@ begin
   end;
 end;
 
+function TdwlParams.TryGetFromPersistHook(const LowerKey: string; var Value: TValue): boolean;
+begin
+  Result := Assigned(FPersistHook) and FPersistHook.TryGetValue(LowerKey, Value);
+  if Result then
+    FParams.Add(Lowerkey, Value);
+end;
+
 function TdwlParams.TryGetInt64Value(const Key: string; out Value: Int64): boolean;
 begin
   var V: TValue;
@@ -873,26 +1219,40 @@ begin
 end;
 
 function TdwlParams.TryGetStrValue(const Key: string; out Value: string): boolean;
-var
- V: TValue;
 begin
+  var V: TValue;
   Result := TryGetValue(Key, V);
   if Result then
     Value := V.ToString;
 end;
 
+function TdwlParams.TryGetUnixEpochValue(const Key: string; out Value: TUnixEpoch): boolean;
+begin
+  var V: TValue;
+  Result := TryGetValue(Key, V);
+  if not Result then
+    Exit;
+  var IntVal: Int64;
+  Result := V.TryAsType(IntVal, false);
+  if Result then
+    Value := IntVal;
+end;
+
 function TdwlParams.TryGetValue(const Key: string; out Value: TValue): boolean;
 begin
   var LowerKey := Key.ToLower;
-  Result := FParams.TryGetValue(LowerKey, Value);
+  Result := TryGetBareValue(LowerKey, Value);
   if not Result then
-  begin // try to find a metakey and apply the default
+  begin // try to find a metakey and let the metakey provide a value
     var MetaKey: TdwlMetaKey;
-    if (FDomain<>'') and FMetaKeys.TryGetValue(DictKey(FDomain, LowerKey), MetaKey) and
-      (not MetaKey.Default.IsEmpty) then
+    if TryGetMetaKey(LowerKey, MetaKey) then
     begin
-      Result := true;
-      Value := MetaKey.Default;
+      Result := MetaKey.TryCalculateValue(Self, LowerKey, Value);
+      if (not Result) and (not MetaKey.FDefaultValue.IsEmpty) then
+      begin
+        Result := true;
+        Value := MetaKey.FDefaultValue;
+      end;
     end;
   end;
   if Result then
@@ -907,10 +1267,15 @@ begin
   end;
 end;
 
-function TdwlParams.TryGetValue<T>(const Key: string; out Value: T): boolean;
+function TdwlParams.UnixEpochValue(const Key: string; const Default: Int64=0): TUnixEpoch;
 begin
-  var V: TValue;
-  Result := TryGetValue(Key, V) and V.TryAsType(Value, false);
+  if not TryGetUnixEpochValue(Key, Result) then
+    Result := Default;
+end;
+
+procedure TdwlParams.UnRegisterPersistHook;
+begin
+  FPersistHook := nil;
 end;
 
 function TdwlParams.GetValue(const Key: string; Default: TValue): TValue;
@@ -963,20 +1328,45 @@ begin
   end;
 end;
 
-procedure TdwlParams.WriteValue(const Key: string; const Value: TValue);
+procedure TdwlParams.WriteValue(const Key: string; const Value: TValue; SkipPersisting: boolean=false);
 begin
   var Lowerkey := Key.ToLower;
-  // If a changecallback procedure or triggers are registered, we're introducing an optimization
-  // So that the callbacck will only be called on a real change
   var OldValue: TValue;
-  if (Assigned(FChangeMethodCallbackProc) or Assigned(FChangeRegularCallbackProc) or (FTriggers<>nil)) and
-    TryGetBareValue(LowerKey, OldValue) and Value.Equals(OldValue) then
+  var MetaKey: TdwlMetaKey;
+  var MetaKeyAvailable := TryGetMetaKey(LowerKey, MetaKey);
+  var OldValueAvailable := TryGetBareValue(LowerKey, OldValue);
+  if OldValueAvailable and Value.Equals(OldValue) then
     Exit;
-  FParams.AddOrSetValue(Lowerkey, Value);
-  if Assigned(FChangeMethodCallbackProc) then
-    FChangeMethodCallbackProc(Self, LowerKey, Value);
-  if Assigned(FChangeRegularCallbackProc) then
-    FChangeRegularCallbackProc(Self, LowerKey, Value);
+  // do not write default value
+  if MetaKeyAvailable and (not MetaKey.FWriteDefaultValue) and MetaKey.FDefaultValue.Equals(Value) then
+  begin // don't write the default value, remove the current
+    if OldValueAvailable then
+    begin
+      FParams.Remove(LowerKey);
+      if Assigned(FPersistHook) then
+        FPersistHook.ClearKey(LowerKey);
+    end
+    else
+      Exit; // writing the default without old value is no change
+  end
+  else
+  begin // write the value
+    if MetaKeyAvailable then
+      MetaKey.Check(Value);
+    if Assigned(FPersistHook) and (not SkipPersisting) then
+      FPersistHook.AddOrSetValue(LowerKey, Value);
+    FParams.AddOrSetValue(Lowerkey, Value);
+  end;
+  if Assigned(FChangeMethodCallbackProc) or Assigned(FChangeRegularCallbackProc) then
+  begin
+    if (not FChangeCallBacksRestrictedToConfiguredMetaKeys) or (MetaKeyAvailable and MetaKey.FChangeTracking) then
+    begin
+      if Assigned(FChangeMethodCallbackProc) then
+        FChangeMethodCallbackProc(Self, LowerKey, Value);
+      if Assigned(FChangeRegularCallbackProc) then
+        FChangeRegularCallbackProc(Self, LowerKey, Value);
+    end;
+  end;
   ExecuteTriggers(LowerKey);
 end;
 
@@ -1019,10 +1409,144 @@ end;
 
 { TdwlMetaKey }
 
-constructor TdwlMetaKey.Create(ADefault: TValue);
+procedure TdwlMetaKey.Check(Value: TValue);
+begin
+  // not yet implemented
+end;
+
+constructor TdwlMetaKey.Create(TypeInfo: PTypeInfo);
 begin
   inherited Create;
-  FDefault := ADefault;
+  FTypeInfo := TypeInfo;
+  FDefaultValue := TValue.Empty;
+  FMinimumValue := TValue.Empty;
+  FMaximumValue := TValue.Empty;
+end;
+
+destructor TdwlMetaKey.Destroy;
+begin
+  FCalculators.Free;
+  inherited Destroy;
+end;
+
+procedure TdwlMetaKey.RegisterCalculateProc(CalcProc: TParamTryCalculateProc);
+begin
+  if FCalculators=nil then
+    FCalculators := TList<TParamTryCalculateProc>.Create;
+  FCalculators.Add(CalcProc);
+end;
+
+function TdwlMetaKey.TryCalculateValue(Params: IdwlParams; const LowerKey: string; var Value: TValue): boolean;
+begin
+  Result := false;
+  if FCalculators=nil then
+    Exit;
+  var Idx := 0;
+  while (not Result) and (Idx<FCalculators.Count) do
+  begin
+    Result := FCalculators[Idx](Params, LowerKey, Value);
+    inc(Idx);
+  end;
+  if Result then // caching: write into the params
+    Params.WriteValue(LowerKey, Value, true);
+end;
+
+{ TdwlMetaKeyBuilder }
+
+function TdwlMetakeyBuilder.CalculateProc(CalculateProc: TParamTryCalculateProc): IdwlMetaKeyBuilder;
+begin
+  FMetaKey.RegisterCalculateProc(CalculateProc);
+  Result := Self;
+end;
+
+function TdwlMetakeyBuilder.ChangeTracking(const ChangeTrackingEnabled: boolean): IdwlMetaKeyBuilder;
+begin
+  FMetaKey.FChangeTracking := ChangeTrackingEnabled;
+  Result := Self;
+end;
+
+constructor TdwlMetakeyBuilder.Create(MetaKey: TdwlMetaKey);
+begin
+  FMetaKey := MetaKey;
+end;
+
+function TdwlMetaKeyBuilder.DefaultValue(DefaultValue: TValue): IdwlMetaKeyBuilder;
+begin
+  FMetaKey.FDefaultValue := DefaultValue.Cast(FMetaKey.FTypeInfo);
+  Result := Self;
+end;
+
+function TdwlMetakeyBuilder.MaximumValue(MaximumValue: TValue): IdwlMetaKeyBuilder;
+begin
+  FMetaKey.FMaximumValue := MaximumValue.Cast(FMetaKey.FTypeInfo);
+  Result := Self;
+end;
+
+function TdwlMetakeyBuilder.MinimumValue(MinimumValue: TValue): IdwlMetaKeyBuilder;
+begin
+  FMetaKey.FMinimumValue := MinimumValue.Cast(FMetaKey.FTypeInfo);
+  Result := Self;
+end;
+
+function TdwlMetakeyBuilder.Prettyname(const PrettyName: string): IdwlMetaKeyBuilder;
+begin
+  FMetaKey.FPrettyName := PrettyName;
+  Result := Self;
+end;
+
+function TdwlMetakeyBuilder.WriteDefaultValue: IdwlMetaKeyBuilder;
+begin
+  FMetaKey.FWriteDefaultValue := true;
+  Result := Self;
+end;
+
+{ TdwlMetakeyConsulter }
+
+constructor TdwlMetakeyConsulter.Create(const Key: string; MetaKey: TdwlMetaKey);
+begin
+  inherited Create;
+  FKey := Key;
+  FMetaKey := MetaKey;
+end;
+
+function TdwlMetakeyConsulter.DefaultValue: TValue;
+begin
+  if FMetaKey<>nil then
+    Result := FMetaKey.FDefaultValue
+  else
+    Result := TValue.Empty;
+end;
+
+function TdwlMetakeyConsulter.MaximumValue: TValue;
+begin
+  if FMetaKey<>nil then
+    Result := FMetaKey.FMaximumValue
+  else
+    Result := TValue.Empty;
+end;
+
+function TdwlMetakeyConsulter.MinimumValue: TValue;
+begin
+  if FMetaKey<>nil then
+    Result := FMetaKey.FMinimumValue
+  else
+    Result := TValue.Empty;
+end;
+
+function TdwlMetakeyConsulter.Prettyname: string;
+begin
+  if FMetaKey<>nil then
+    Result := FMetaKey.FPrettyName
+  else
+    Result := FKey;
+end;
+
+function TdwlMetakeyConsulter.TypeInfo: PTypeInfo;
+begin
+  if FMetaKey<>nil then
+    Result := FMetaKey.FTypeInfo
+  else
+    Result := nil;
 end;
 
 end.

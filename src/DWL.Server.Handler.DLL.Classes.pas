@@ -10,7 +10,7 @@ interface
 
 uses
   DWL.Server.Types, DWL.Params, System.Generics.Collections,
-  System.Classes, System.JSON, DWL.MySQL, Winapi.WinInet, DWL.OpenID;
+  System.Classes, System.JSON, DWL.MySQL, Winapi.WinInet, DWL.OpenID, IdMessage;
 
 type
   TEndpoint_HandleProc = function(const State: PdwlHTTPHandlingState): boolean of object;
@@ -127,6 +127,10 @@ type
     ///   don't write to it!
     /// </summary>
     class function TryGetPayloadPtr(const State: PdwlHTTPHandlingState; out Data: pointer; out DataSize: Int64): boolean;
+    /// <summary>
+    ///   Sends an Email through by using the Mailsend service of the the DWLServer
+    /// </summary>
+    class function SendEMail(const State: PdwlHTTPHandlingState; MailMsg: TIdMessage): boolean;
   public
     class function Authorize(const State: PdwlHTTPHandlingState): boolean; virtual;
     class procedure Configure(const Params: string); virtual;
@@ -147,8 +151,9 @@ implementation
 
 uses
   DWL.HTTP.Consts, System.SysUtils, DWL.JOSE, DWL.Types, DWL.Params.Consts,
-  System.Rtti, System.DateUtils, DWL.Logging, DWL.Logging.API,
-  DWL.Server.Utils, DWL.Server.Globals, DWL.Server.Consts;
+  System.Rtti, System.DateUtils, DWL.Logging, DWL.Logging.DWLServer,
+  DWL.Server.Utils, DWL.Server.Globals, DWL.Server.Consts, DWL.Mail.Utils,
+  DWL.MediaTypes;
 
 const
   Param_Body_JSON='body_json';
@@ -175,7 +180,7 @@ begin
   begin
     Result := nil;
     var CType: string;
-    if TryGetHeaderValue(State, HTTP_FIELD_CONTENT_TYPE, CType) and SameText(Copy(CType, 1, CONTENT_TYPE_JSON.Length), CONTENT_TYPE_JSON) then
+    if TryGetHeaderValue(State, HTTP_FIELD_CONTENT_TYPE, CType) and SameText(Copy(CType, 1, MEDIA_TYPE_JSON.Length), MEDIA_TYPE_JSON) then
     begin
       var PostData: pointer;
       var PostDataSize: Int64;
@@ -206,7 +211,7 @@ begin
   FConfigParams.WriteNameValueText(Params);
   FEndpoint := FConfigParams.StrValue(Param_Endpoint);
   FServerBaseURL := FConfigParams.StrValue(Param_ServerBaseURL);
-  EnableLogDispatchingToAPI(FServerBaseURL+EndpointURI_Log, FConfigParams.StrValue(Param_LogSecret))
+  EnableLogDispatchingToDWLServer;
 end;
 
 class procedure TdwlDLLHandling.ProcessOptions(const State: PdwlHTTPHandlingState; var Success: boolean; Cmds: THandlingEndpoints_Dictionary);
@@ -262,7 +267,7 @@ begin
       State.SetContentText(PBaseInternalHandlingStructure(State._InternalHandlingStructure).Response_JSON.ToJSON, '');
       var ContentType: string;
       if not State.TryGetResponseHeaderValue(HTTP_FIELD_CONTENT_TYPE, ContentType) then
-        State.SetContentType(CONTENT_TYPE_JSON, CHARSET_UTF8);
+        State.SetContentType(MEDIA_TYPE_JSON, CHARSET_UTF8);
       PBaseInternalHandlingStructure(State._InternalHandlingStructure).Response_JSON.Free;
     end;
     if PBaseInternalHandlingStructure(State._InternalHandlingStructure).Params<>nil then
@@ -480,6 +485,12 @@ begin
     Response_JSON(State).AddPair('success', TJSONBool.Create(IsSuccess));
 end;
 
+class function TdwlDLLHandling.SendEMail(const State: PdwlHTTPHandlingState; MailMsg: TIdMessage): boolean;
+begin
+  var MailStr := TdwlMailUtils.IdMessageToString(MailMsg);
+  Result := serverProcs.CallServiceProc(State, serverservice_SendEMail, PWideChar(MailStr))=1;
+end;
+
 class function TdwlDLLHandling.ServerBaseURL: string;
 begin
   Result := FServerBaseURL;
@@ -527,7 +538,10 @@ end;
 class procedure TdwlDLLHandling.WrapUp(const State: PdwlHTTPHandlingState);
 begin
   if (State=nil) then
+  begin
     FHandlingEndpoints.Free;
+    TdwlLogger.FinalizeDispatching;
+  end;
 end;
 
 function THandlingEndpoint_Props.ScopesAllowed(const State: PdwlHTTPHandlingState): boolean;

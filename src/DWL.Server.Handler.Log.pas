@@ -84,7 +84,7 @@ type
     destructor Destroy; override;
     function Authorize(const State: PdwlHTTPHandlingState): boolean; override;
     function ProcessRequest(const State: PdwlHTTPHandlingState): boolean; override;
-    function SubmitLog(const IpAddress: string; Level: Byte; const Source, Channel, Topic, Msg, ContentType: string; const Content: TBytes): boolean;
+    function SubmitLog(const IpAddress: string; Level: Byte; const Source, Channel, Topic, Msg, ContentType: string; const Content: TBytes; ForwardLog: boolean): boolean;
   end;
 
 implementation
@@ -110,7 +110,7 @@ constructor TdwlHTTPHandler_Log.Create(AParams: IdwlParams);
 begin
   inherited Create;
   FMySQL_Profile := New_Params;
-  AParams.AssignTo(FMySQL_Profile, Params_SQLConnection);
+  AParams.AssignKeysTo(FMySQL_Profile, Params_SQLConnection);
   FLogSecret := AParams.StrValue(param_LogSecret);
   FTriggers := TList<TLogTrigger>.Create;
   FTriggerProcessing := TCriticalSection.Create;
@@ -282,7 +282,7 @@ begin
     end;
   except
     on E:Exception do
-      SubmitLog('', integer(lsError), '', '', '', 'Error loading Triggers: '+E.Message, '', nil);
+      SubmitLog('', integer(lsError), '', '', '', 'Error loading Triggers: '+E.Message, '', nil, {$IFDEF DEBUG}true{$ELSE}false{$ENDIF});
   end;
 end;
 
@@ -297,6 +297,8 @@ begin
 end;
 
 function TdwlHTTPHandler_Log.Post_Log(const State: PdwlHTTPHandlingState): boolean;
+const
+  defSourceChannelTopic = 'default';
 var
   LogSecret: string;
   Msg: String;
@@ -324,7 +326,14 @@ begin
   if not State.TryGetRequestParamStr('channel', Channel) then
     Channel := '';
   if not State.TryGetRequestParamStr('topic', Topic) then
-    Channel := '';
+    Topic := '';
+  // because regexes do not trigger on empty strings, enforce a default source/channel/topic
+  if Source='' then
+    Source := defSourceChannelTopic;
+  if Channel='' then
+    Channel := defSourceChannelTopic;
+  if Topic='' then
+    Topic := defSourceChannelTopic;
   var Data: pointer;
   var DataSize: Int64;
   var Content: TBytes := nil;
@@ -340,7 +349,7 @@ begin
   end
   else
     ContentType := '';
-  if not SubmitLog(IpAddress, Level, Source, Channel, Topic, Msg, ContentType, Content) then
+  if not SubmitLog(IpAddress, Level, Source, Channel, Topic, Msg, ContentType, Content, {$IFDEF DEBUG}true{$ELSE}false{$ENDIF}) then
     State.StatusCode := HTTP_STATUS_SERVER_ERROR;
   serverProcs.SetHeaderValueProc(State, 'Access-Control-Allow-Origin', '*');
   Result := true;
@@ -418,14 +427,14 @@ begin
       end;
     except
       on E: Exception do
-        SubmitLog('', integer(lsError), '', '', '', 'Error executing trigger: '+E.Message, '', nil);
+        SubmitLog('', integer(lsError), '', '', '', 'Error executing trigger: '+E.Message, '', nil, {$IFDEF DEBUG}true{$ELSE}false{$ENDIF});
     end;
   finally
     FTriggerProcessing.Leave;
   end;
 end;
 
-function TdwlHTTPHandler_Log.SubmitLog(const IpAddress: string; Level: Byte; const Source, Channel, Topic, Msg, ContentType: string; const Content: TBytes): boolean;
+function TdwlHTTPHandler_Log.SubmitLog(const IpAddress: string; Level: Byte; const Source, Channel, Topic, Msg, ContentType: string; const Content: TBytes; ForwardLog: boolean): boolean;
 const
   SQL_Insert_Debug=
     'INSERT INTO dwl_log_debug (IpAddress, Level, Source, Channel, Topic, Msg, ContentType, Content) values (?, ?, ?, ?, ?, ?, ?, ?)';
@@ -454,9 +463,7 @@ begin
     else
       Cmd.Parameters.SetBinaryRefDataBinding(7, @Content[0], Length(Content));
     Cmd.Execute;
-    {$IFDEF DEBUG}
-    // Forward the logmessage to the server for debugging purposes
-    if Source<>TdwlLogger.Default_Source then
+    if ForwardLog then
     begin
       var LogItem := TdwlLogger.PrepareLogitem;
       LogItem.Msg := Msg;
@@ -469,7 +476,6 @@ begin
       LogItem.Destination := logdestinationServerConsole;
       TdwlLogger.Log(LogItem);
     end;
-    {$ENDIF}
     // Process the triggers
     ProcessTriggers(IpAddress, Level, Source, Channel, Topic, Msg, ContentType, Content);
     Result := true;

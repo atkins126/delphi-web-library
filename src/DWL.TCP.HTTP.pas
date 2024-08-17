@@ -86,7 +86,7 @@ implementation
 uses
   Winapi.Windows, System.SysUtils, System.NetEncoding,
   System.StrUtils, DWL.HTTP.Utils, DWL.HTTP.Consts, DWL.Logging,
-  System.Threading;
+  System.Threading, DWL.MediaTypes;
 
 type
   TRequestLogDispatchThread = class(TdwlThread)
@@ -126,22 +126,25 @@ procedure TdwlCustomHTTPServer.LogRequest(Socket: TdwlHTTPSocket);
 begin
   if FRequestLogDispatchThread<>nil then
   begin
-    var RequestLog: TdwlRequestLogItem;
-    RequestLog.Method := Socket.RequestMethod;
-    RequestLog.IP_Remote := Socket.Ip_Remote;
-    RequestLog.Port_Local := Socket.Port_Local;
-    RequestLog.Uri := Socket.Uri;
-    RequestLog.StatusCode := Socket.StatusCode;
-    RequestLog.Duration := Socket.RequestDuration;
-    RequestLog.Headers := Socket.RequestHeaders.GetAsNameValueText(false);
-    RequestLog.Params := '';
-    var Prms := Socket.RequestParams;
-    // clear sensitive information before logging
-    Prms.Values['password'] := '';
-    for var i := 0 to Prms.Count-1 do
-       RequestLog.Params :=  RequestLog.Params+Prms.Names[i]+'='+TNetEncoding.URL.Decode(Prms.ValueFromIndex[i])+#13#10;
-
-    TRequestLogDispatchThread(FRequestLogDispatchThread).LogRequest(RequestLog);
+    try
+      var RequestLog: TdwlRequestLogItem;
+      RequestLog.Method := Socket.RequestMethod;
+      RequestLog.IP_Remote := Socket.Ip_Remote;
+      RequestLog.Port_Local := Socket.Port_Local;
+      RequestLog.Uri := Socket.Uri;
+      RequestLog.StatusCode := Socket.StatusCode;
+      RequestLog.Duration := Socket.RequestDuration;
+      RequestLog.Headers := Socket.RequestHeaders.GetAsNameValueText(false);
+      RequestLog.Params := '';
+      var Prms := Socket.RequestParams;
+      // clear sensitive information before logging
+      Prms.Values['password'] := '';
+      for var i := 0 to Prms.Count-1 do
+         RequestLog.Params :=  RequestLog.Params+Prms.Names[i]+'='+TNetEncoding.URL.Decode(Prms.ValueFromIndex[i])+#13#10;
+        TRequestLogDispatchThread(FRequestLogDispatchThread).LogRequest(RequestLog);
+    except
+      // logging errors are mostly due to invalid requests (Problems in NetEncoding.Decode), so skip logging if that is the case
+    end;
   end;
 end;
 
@@ -263,7 +266,7 @@ begin
     end;
   end;
   var ContTypeHeader := TdwlHTTPUtils.ParseHTTPFieldValue(RequestHeaders.StrValue(HTTP_FIELD_CONTENT_TYPE));
-  if SameText(ContTypeHeader.MainValue, CONTENT_TYPE_X_WWW_FORM_URLENCODED) and (FRequestBodyStream<>nil) then
+  if SameText(ContTypeHeader.MainValue, MEDIA_TYPE_X_WWW_FORM_URLENCODED) and (FRequestBodyStream<>nil) then
   begin
     var WideStr: string;;
     var CodePage := TdwlHTTPUtils.MIMEnameToCodepage(ContTypeHeader.SubValue(HTTP_SUBFIELD_CHARSET, CHARSET_UTF8));
@@ -274,12 +277,16 @@ begin
     var Query := WideStr.Split(['&']);
     for var Param in Query do
     begin
-      P := pos('=', Param);
-      if P>1 then
-        // leave the value undecoded, to be able to use stringlist with all provided string values
-        RequestParams.Add(TNetEncoding.URL.Decode(Copy(Param, 1, P-1))+'='+Copy(Param, P+1, MaxInt))
-      else
-        RequestParams.Add(TNetEncoding.URL.Decode(Param));
+      try
+        P := pos('=', Param);
+        if P>1 then
+          // leave the value undecoded, to be able to use stringlist with all provided string values
+          RequestParams.Add(TNetEncoding.URL.Decode(Copy(Param, 1, P-1))+'='+Copy(Param, P+1, MaxInt))
+        else
+          RequestParams.Add(TNetEncoding.URL.Decode(Param));
+      except
+        ReadError('Error Decoding URL Parameter: '+Param);
+      end;
     end;
   end;
 end;
@@ -435,7 +442,7 @@ begin
       begin
         if FReadError<>'' then
         begin
-          FResponseHeaders.WriteValue(HTTP_FIELD_CONTENT_TYPE, CONTENT_TYPE_HTML);
+          FResponseHeaders.WriteValue(HTTP_FIELD_CONTENT_TYPE, MEDIA_TYPE_HTML);
           var ErrStr := ansistring('<html><body><h1>'+TNetEncoding.HTML.Encode(FReadError)+'</h1></body></html>');
           FResponseDataStream.WriteBuffer(PAnsiChar(ErrStr)^, Length(ErrStr));
         end;

@@ -13,15 +13,28 @@ type
     class function IsValidEmailAddress(const Value: string; Options: TdwlMailCheckOptions=[]): boolean; static;
     class function SendMailToAPI(const Endpoint, LogSecret: string; Msg: TIdMessage): TdwlResult; static;
     class function IdMessageToBytes(Msg: TIdMessage): TBytes; static;
+    class function IdMessageToString(Msg: TIdMessage): string; static;
+    class procedure FilldIdMessageFromString(Msg: TIdMessage; const Value: string); static;
   end;
 
 implementation
 
 uses
   System.RegularExpressions, System.Classes, DWL.HTTP.Client, DWL.HTTP.Consts,
-  System.NetEncoding, Winapi.WinInet;
+  System.NetEncoding, Winapi.WinInet, DWL.MediaTypes;
 
 { TdwlMailUtils }
+
+class procedure TdwlMailUtils.FilldIdMessageFromString(Msg: TIdMessage; const Value: string);
+begin
+  var Stream := TStringStream.Create(Value);
+  try
+    Msg.LoadFromStream(Stream);
+    Msg.ProcessHeaders;
+  finally
+    Stream.Free;
+  end;
+end;
 
 class function TdwlMailUtils.IdMessageToBytes(Msg: TIdMessage): TBytes;
 begin
@@ -32,6 +45,18 @@ begin
     SetLength(Result, Size);
     Stream.Seek(0, soBeginning);
     Stream.Read(Result, Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
+class function TdwlMailUtils.IdMessageToString(Msg: TIdMessage): string;
+begin
+  var Stream := TStringStream.Create;
+  try
+    Msg.SaveToStream(Stream);
+    Stream.Seek(0, soBeginning);
+    Result := Stream.ReadString(MaxInt);
   finally
     Stream.Free;
   end;
@@ -85,7 +110,7 @@ begin
   finally
     Stream.Free;
   end;
-  Request.Header[HTTP_FIELD_CONTENT_TYPE] := CONTENT_TYPE_OCTET_STREAM;
+  Request.Header[HTTP_FIELD_CONTENT_TYPE] := MEDIA_TYPE_OCTET_STREAM;
   Request.Method  := HTTP_METHOD_POST;
   var Response := Request.Execute;
   if Response.StatusCode<>HTTP_STATUS_OK then

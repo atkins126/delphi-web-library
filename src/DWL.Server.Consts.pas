@@ -30,6 +30,9 @@ const
 
   logdestinationServerConsole='serverconsole';
 
+  serverservice_SendEMail = 1;
+  serverservice_Log = 2;
+
 implementation
 
 end.

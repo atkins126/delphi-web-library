@@ -48,8 +48,9 @@ type
     ///   Queues an Indy TIdMessage for sending. Please note ownership of
     ///   the IdMessage is not taken! You have to free it yourself (because you
     ///   also created it ;-)
+    ///   if not configured yet the result of the function is false, otherwise true
     /// </summary>
-    class procedure QueueForSending(Msg: TIdMessage); static;
+    class function QueueForSending(Msg: TIdMessage): boolean; static;
   end;
 
 
@@ -196,7 +197,7 @@ begin
   else
   begin
     var ThreadParams := New_Params;
-    FParams.AssignTo(ThreadParams, Params_SQLConnection);
+    FParams.AssignKeysTo(ThreadParams, Params_SQLConnection);
     FMailSendThread := TMailSendThread.Create(ThreadParams);
     FMailSendThread.FreeOnTerminate := true;
   end;
@@ -262,10 +263,14 @@ begin
   end;
 end;
 
-class procedure TdwlMailQueue.QueueForSending(Msg: TIdMessage);
+class function TdwlMailQueue.QueueForSending(Msg: TIdMessage): boolean;
 const
   SQL_InsertInQueue = 'INSERT INTO dwl_mailqueue (bccrecipients, eml) VALUES (?, ?)';
 begin
+  // First check if configured
+  Result := FParams<>nil;
+  if not Result then
+    Exit;
   CheckMailSendThread;
   var Str := TStringStream.Create;
   try

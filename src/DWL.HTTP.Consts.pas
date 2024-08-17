@@ -8,18 +8,9 @@ const
   CONNECTION_CLOSE = 'Close';
   CONNECTION_KEEP_ALIVE = 'Keep-Alive';
 
-  CONTENT_TYPE_7Z = 'application/x-7z-compressed';
-  CONTENT_TYPE_HTML = 'text/html';
-  CONTENT_TYPE_IMAGE_PNG = 'image/png';
-  CONTENT_TYPE_JOSE_JSON = 'application/jose+json';
-  CONTENT_TYPE_JSON = 'application/json';
-  CONTENT_TYPE_JSONAPI = 'application/vnd.api+json';
-  CONTENT_TYPE_OCTET_STREAM = 'application/octet-stream';
-  CONTENT_TYPE_PLAIN = 'text/plain';
-  CONTENT_TYPE_X_WWW_FORM_URLENCODED = 'application/x-www-form-urlencoded';
-
   EXPECT_100_CONTINUE = '100-continue';
 
+  HTTP_FIELD_AUTHORIZATION = 'Authorization';
   HTTP_FIELD_CACHE_CONTROL = 'Cache-Control';
   HTTP_FIELD_CONNECTION = 'Connection';
   HTTP_FIELD_CONTENT_DISPOSITION = 'Content-Disposition';
@@ -40,6 +31,8 @@ const
   HTTP_METHOD_PUT = 'PUT';
   HTTP_METHOD_TRACE = 'TRACE';
   HTTP_METHOD_UNKNOWN = 'UNKNOWN';
+
+  HTTP_AUTHORIZATION_BEARER = 'Bearer';
 
   HTTP_SUBFIELD_CHARSET = 'charset';
 

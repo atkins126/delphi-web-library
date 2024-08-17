@@ -96,7 +96,7 @@ implementation
 
 uses
   DWL.HTTP.Client, DWL.HTTP.Consts, System.NetEncoding, Winapi.WinInet,
-  System.StrUtils, DWL.OpenSSL, System.SysUtils;
+  System.StrUtils, DWL.OpenSSL, System.SysUtils, DWL.MediaTypes;
 
 { TOIDC_Client }
 
@@ -137,7 +137,7 @@ begin
   InitFromIssuer;
   var Request := New_HTTPRequest(FToken_Endpoint);
   Request.Method := HTTP_METHOD_POST;
-  Request.Header['Content-Type'] := CONTENT_TYPE_X_WWW_FORM_URLENCODED;
+  Request.Header['Content-Type'] := MEDIA_TYPE_X_WWW_FORM_URLENCODED;
   Request.WritePostData('code='+TNetEncoding.URL.Encode(Code)+
     '&client_id='+TNetEncoding.URL.Encode(FClient_id)+
     '&redirect_uri='+TNetEncoding.URL.Encode(FRedirect_Uri)+
@@ -157,15 +157,24 @@ begin
   InitFromIssuer;
   var Request := New_HTTPRequest(FToken_Endpoint);
   Request.Method := HTTP_METHOD_POST;
-  Request.Header['Content-Type'] := CONTENT_TYPE_X_WWW_FORM_URLENCODED;
+  Request.Header['Content-Type'] := MEDIA_TYPE_X_WWW_FORM_URLENCODED;
   Request.WritePostData(keyREFRESH_TOKEN+'='+TNetEncoding.URL.Encode(Refresh_Token)+
     '&client_id='+TNetEncoding.URL.Encode(FClient_id)+
     '&grant_type=refresh_token');
   var Response := Request.Execute;
   if Response.StatusCode<>HTTP_STATUS_OK then
   begin
-    if Response.StatusCode=HTTP_STATUS_DENIED then
-      Refresh_Token := ''; // we need to re-authenticate
+    if Response.StatusCode=HTTP_STATUS_BAD_REQUEST then
+    begin
+      var JSON := TJSONObject.ParseJSONValue(Response.AsString);
+      try
+        var ErrorString := JSON.GetValue<string>('error');
+        if ErrorString='invalid_grant' then
+          Refresh_Token := ''; // we need to re-authenticate
+      finally
+        JSON.Free;
+      end;
+    end;
     Result.AddErrorMsg('error fetching tokens from OIDC Provider');
     Exit;
   end;
