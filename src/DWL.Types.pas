@@ -76,11 +76,11 @@ type
     /// </param>
     function ToString(Fmt: string='yyyy-mm-dd hh:nn:ss'): string;
     /// <summary>
-    ///   Convert the Unix time to a datetime. Resulting string is always UTC,
-    ///   unless explicitcalled with AReturnUTC=false, than local time will be returned
+    ///   Convert the Unix time to a datetime. Resulting string is UTC,
+    ///   unless explicitly called with AReturnUTC=false
     /// </summary>
-    /// <param name="Fmt">
-    ///   The format to be used to create the resulting string
+    /// <param name="AReturnUTC">
+    ///   If false result will be in local datetime
     /// </param>
     function ToDateTime(AReturnUTC: boolean=true): TDateTime;
     /// <summary>
@@ -640,3 +640,4 @@ begin
 end;
 
 end.
+
