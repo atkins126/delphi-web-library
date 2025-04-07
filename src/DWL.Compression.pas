@@ -3,7 +3,7 @@ unit DWL.Compression;
 interface
 
 uses
-  JclCompression, DWL.Classes;
+  JclCompression, DWL.Classes, DWL.IOUtils;
 
 type
   TdwlCompression = record
@@ -11,13 +11,13 @@ type
     class constructor Create;
     class function ExtractArchive(const ArchiveFileName: string; const DestinationDir: string=''; const Password: string=''; OnProgress: TJclCompressionProgressEvent=nil): TdwlResult; static;
     class function ZipFile(const ArchiveFileName, FileToZip: string): TdwlResult; static;
-    class function ZipDirectory(const ArchiveFileName, DirectoryToZip: string; const FileMask: string = '*.*'): TdwlResult; static;
+    class function ZipDirectory(const ArchiveFileName, DirectoryToZip: string; Options: TdwlIOEnumOptions=[ioIncludeFiles]; const FileMask: string = '*.*'): TdwlResult; static;
   end;
 
 implementation
 
 uses
-  System.SysUtils, sevenzip, DWL.IOUtils, System.Classes;
+  System.SysUtils, sevenzip, System.Classes;
 
 { TdwlCompression }
 
@@ -51,19 +51,16 @@ begin
   end;
 end;
 
-class function TdwlCompression.ZipDirectory(const ArchiveFileName, DirectoryToZip: string; const FileMask: string = '*.*'): TdwlResult;
+class function TdwlCompression.ZipDirectory(const ArchiveFileName, DirectoryToZip: string; Options: TdwlIOEnumOptions=[ioIncludeFiles]; const FileMask: string = '*.*'): TdwlResult;
 begin
   try
+    // in case someone asked something strange:
+    Options := Options - [ioIncludeDirectories];
     var CompressArchive :=  TJcl7ZCompressArchive.Create(ArchiveFileName);
     try
-      var ListedItems := TStringList.Create;
-      try
-        TdwlPath.Listing(ListedItems, DirectoryToZip, FileMask);
-        for var Item in ListedItems do
-          CompressArchive.AddFile(ExtractFilename(Item), Item);
-      finally
-        ListedItems.Free;
-      end;
+      var ENum := TdwlDirectory.Enumerator(DirectoryToZip, Options, FileMask);
+      while ENum.MoveNext do
+        CompressArchive.AddFile(ENum.Current.RelativePathName, ENum.Current.FullPathName);
       CompressArchive.Compress;
     finally
       CompressArchive.Free;

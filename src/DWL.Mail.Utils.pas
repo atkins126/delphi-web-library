@@ -3,7 +3,8 @@ unit DWL.Mail.Utils;
 interface
 
 uses
-  IdMessage, System.SysUtils, DWL.Classes;
+  IdMessage, System.SysUtils, DWL.Classes, IdAttachment, System.Classes,
+  IdAttachmentFile;
 
 type
   TdwlMailCheckOption=(mcEmptyStringIsValid, mcDoNotTrimSpaces, mcEvaluateCommaSeparatedList);
@@ -14,18 +15,33 @@ type
     class function SendMailToAPI(const Endpoint, LogSecret: string; Msg: TIdMessage): TdwlResult; static;
     class function IdMessageToBytes(Msg: TIdMessage): TBytes; static;
     class function IdMessageToString(Msg: TIdMessage): string; static;
-    class procedure FilldIdMessageFromString(Msg: TIdMessage; const Value: string); static;
+    class procedure FillIdMessageFromString(Msg: TIdMessage; const Value: string); static;
+    /// <summary>
+    ///   Creates an TIdMessage and applies bugfix for temp file naming
+    ///  Use this function wherever you want to create an IdMessage
+    ///  So we can prepare the message with these kind of things
+    /// </summary>
+    class function New_IdMessage: TIdMessage; static;
+  end;
+
+type
+  TIdAttachmentFile_BetterTempFile = class(TIdAttachmentFile)
+  private
+    class procedure CreateAttachment(const AMsg: TIdMessage; const AHeaders: TStrings; var AAttachment: TIdAttachment);
+  public
+    function PrepareTempStream: TStream; override;
   end;
 
 implementation
 
 uses
-  System.RegularExpressions, System.Classes, DWL.HTTP.Client, DWL.HTTP.Consts,
-  System.NetEncoding, Winapi.WinInet, DWL.MediaTypes;
+  System.RegularExpressions, DWL.HTTP.Client, DWL.HTTP.Consts,
+  System.NetEncoding, Winapi.WinInet, DWL.MediaTypes,
+  IdGlobal, DWL.IOUtils, DWL.Types;
 
 { TdwlMailUtils }
 
-class procedure TdwlMailUtils.FilldIdMessageFromString(Msg: TIdMessage; const Value: string);
+class procedure TdwlMailUtils.FillIdMessageFromString(Msg: TIdMessage; const Value: string);
 begin
   var Stream := TStringStream.Create(Value);
   try
@@ -97,6 +113,12 @@ begin
     Result := TRegEx.IsMatch(EMail2Check, EMAIL_REGEX);
 end;
 
+class function TdwlMailUtils.New_IdMessage: TIdMessage;
+begin
+  Result := TIdMessage.Create;
+  Result.OnCreateAttachment := TIdAttachmentFile_BetterTempFile.CreateAttachment;
+end;
+
 class function TdwlMailUtils.SendMailToAPI(const Endpoint, LogSecret: string; Msg: TIdMessage): TdwlResult;
 begin
   var Url := Endpoint+'?secret='+TNetEncoding.URL.Encode(LogSecret);
@@ -115,6 +137,21 @@ begin
   var Response := Request.Execute;
   if Response.StatusCode<>HTTP_STATUS_OK then
     Result.AddErrorMsg('Error '+Response.StatusCode.ToString+': '+Response.ErrorMsg);
+end;
+
+{ TIdAttachmentFile_BetterTempFile }
+
+class procedure TIdAttachmentFile_BetterTempFile.CreateAttachment(const AMsg: TIdMessage; const AHeaders: TStrings; var AAttachment: TIdAttachment);
+begin
+  AAttachment := TIdAttachmentFile_BetterTempFile.Create(AMsg.MessageParts);
+end;
+
+function TIdAttachmentFile_BetterTempFile.PrepareTempStream: TStream;
+begin
+  FStoredPathName := TdwlDirectory.Application_TempDir+'\Indy_'+TdwlUUID.CreateNew.AsString+'.tmp';
+  FTempFileStream := TIdFileCreateStream.Create(FStoredPathName);
+  FFileIsTempFile := True;
+  Result := FTempFileStream;
 end;
 
 end.

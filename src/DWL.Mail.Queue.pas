@@ -60,7 +60,7 @@ uses
   DWL.MySQL, DWL.Params.Consts, System.JSON, Winapi.Windows, System.SysUtils,
   IdSMTP, IdSSLOpenSSL, DWL.HTTP.APIClient.OAuth2, DWL.HTTP.APIClient, DWL.Mail.SASL,
   IdAssignedNumbers, System.Math, IdExplicitTLSClientServerBase, DWL.Classes,
-  DWL.StrUtils;
+  DWL.StrUtils, DWL.Mail.Utils;
 
 const
   MAILQUEUE_SLEEP_MSECS=120000{2 min};
@@ -350,7 +350,7 @@ begin
         inc(Attempts);
         var Str := TStringStream.Create(Reader.GetString(1));
         try
-          var Msg := TIdMessage.Create(nil);
+          var Msg := TdwlMailUtils.New_IdMessage;
           try
             Msg.LoadFromStream(Str);
             Msg.BccList.EMailAddresses := Cmd_Queue.Reader.GetString(2, true);

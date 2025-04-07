@@ -3,18 +3,53 @@ unit DWL.IOUtils;
 interface
 
 uses
-  System.IOUtils, System.Classes;
+  System.IOUtils, System.Classes,Winapi.Windows;
 
 type
   TdwlFile = record
+    class function Delete(const FileName: string): boolean; static;
     class function ExtractBareName(const Path: string=''): string; static;
+    class procedure SetReadOnlyFlag(const FileName: string; ReadOnly: boolean); static;
   end;
 
-  TdwlPath = record
-    class procedure Listing(const ListedItems: TStrings; const Directory: string;
-      const Mask: string = '*.*'; Recursive: boolean=false; ListDirectories:
-      boolean=false; ListFiles: boolean=true; BareDirOrFileNames: boolean=false;
-      const ExcludeMask: string=''; MaxRecurseDepth:integer=MaxInt); static;
+  TdwlIOEnumOption = (ioRecurse, ioIncludeFiles, ioIncludeDirectories, ioIncludeHidden, ioRemoveReadOnly, ioOverwrite);
+  TdwlIOEnumOptions = set of TdwlIOEnumOption;
+
+  PDirEnum = ^TDirEnum;
+  TDirEnum = record
+  private
+    hFind: THandle;
+    FindData: TWin32FindData;
+    Parent: PDirEnum;
+    BaseDirectory: string;
+    RelativeDirectory: string;
+    class procedure Close(var DirEnum: PDirEnum); static;
+    class function Open(const BaseDirectory, RelativeDirectory: string): PDirENum; static;
+  public
+    function Directory: string;
+    function FullPathName: string;
+    function IsDirectory: boolean;
+    function IsReadOny: boolean;
+    function Name: string;
+    function RelativePathName: string;
+  end;
+
+  IdwlDirectoryEnumerator = interface
+    function Current: PDirEnum;
+    function MoveNext: boolean;
+  end;
+
+  TdwlDirectory = record
+  strict private
+    class var FApplication_TempDir: string;
+  public
+    class destructor Destroy;
+    class function Application_TempDir: string; static;
+    class procedure Copy(const SourceDirectory, DestinationDirectory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles, ioIncludeDirectories, ioRecurse]); static;
+    class procedure Delete(const Directory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles, ioIncludeDirectories, ioRecurse]); static;
+    class procedure Empty(const Directory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles, ioIncludeDirectories, ioRecurse]); static;
+    class procedure Move(const FromDirectory, ToDirectory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles, ioIncludeDirectories, ioRecurse]); static;
+    class function Enumerator(const Directory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles]; const FileMask: string='*.*'): IdwlDirectoryEnumerator; static;
   end;
 
   TdwlFileVersionInfo = record
@@ -45,9 +80,29 @@ type
 implementation
 
 uses
-  System.SysUtils, Winapi.Windows, DWL.Resolver, System.Masks;
+  System.SysUtils, DWL.Resolver, System.Masks, System.StrUtils;
+
+type
+  TdwlDirectoryEnumerator = class(TInterfacedObject, IdwlDirectoryEnumerator)
+  strict private
+    FDirEnum: PDirEnum;
+    FFileMask: string;
+    FOptions: TdwlIOEnumOptions;
+    function UnfilteredMoveNext: boolean;
+  private
+    function Current: PDirEnum;
+    function MoveNext: boolean;
+  public
+    constructor Create(const Directory: string; Options: TdwlIOEnumOptions; const FileMask: string);
+    destructor Destroy; override;
+  end;
 
 { TdwlFile }
+
+class function TdwlFile.Delete(const FileName: string): boolean;
+begin
+  Result := WinApi.Windows.DeleteFile(PChar(FileName));
+end;
 
 class function TdwlFile.ExtractBareName(const Path: string=''): string;
 begin
@@ -55,6 +110,18 @@ begin
     Result := ChangeFileExt(ExtractFileName(GetModuleName(HInstance)),'')
   else
     Result := ChangeFileExt(ExtractFileName(Path),'');
+end;
+
+class procedure TdwlFile.SetReadOnlyFlag(const FileName: string; ReadOnly: boolean);
+begin
+  var Att := GetFileAttributes(PChar(FileName));
+  if ((Att and FILE_ATTRIBUTE_READONLY)>0) and (not ReadOnly) then
+    SetFileAttributes(PChar(Filename), Att-FILE_ATTRIBUTE_READONLY)
+  else
+  begin
+    if ((Att and FILE_ATTRIBUTE_READONLY)=0) and ReadOnly then
+      SetFileAttributes(PChar(Filename), Att+FILE_ATTRIBUTE_READONLY)
+  end;
 end;
 
 { TdwlFileVersionInfo }
@@ -181,13 +248,13 @@ procedure TdwlFileVersionInfo.SetFromFile(const FileName: string);
 begin
   var Success := false;
   var Dummy: DWORD;
-  var VerInfoSize := GetFileVersionInfoSize(PWideChar(FileName), Dummy);
+  var VerInfoSize := GetFileVersionInfoSize(PChar(FileName), Dummy);
   if VerInfoSize>0 then
   begin
     var VerInfo: pointer;
     GetMem(VerInfo, VerInfoSize);
     try
-      if GetFileVersionInfo(PWideChar(FileName), 0, VerInfoSize, VerInfo) then
+      if GetFileVersionInfo(PChar(FileName), 0, VerInfoSize, VerInfo) then
       begin
         var VerValue: PVSFixedFileInfo;
         var VerValueSize: DWORD;
@@ -239,67 +306,261 @@ begin
   Build := StrToIntDef(Copy(VersionStr, P+1, MaxInt), 0);
 end;
 
-{ TdwlPath }
+{ TdwlDirectory }
 
-class procedure TdwlPath.Listing(const ListedItems: TStrings; const Directory, Mask: string;
-  Recursive, ListDirectories, ListFiles, BareDirOrFileNames: boolean;
-  const ExcludeMask: string; MaxRecurseDepth: integer);
-//var
-//  TheDir: string;
-//  SResult: integer;
+class function TdwlDirectory.Application_TempDir: string;
 begin
-  if MaxRecurseDepth<0 then
-    Exit;
-  var ThePath := IncludeTrailingPathDelimiter(Directory);
-  TdwlResolver.Resolve(ThePath);
-  var SearchRec: TSearchRec;
-  var SearchResult := FindFirst(ThePath+Mask, faAnyFile, SearchRec);
-  try
-    while SearchResult = 0 do
-    begin
-      if (ExcludeMask='') or not MatchesMask(SearchRec.Name, ExcludeMask) then
-      begin
-        if (SearchRec.Attr and faDirectory)=0 then
-        begin
-          if ListFiles then
-          begin
-            if BareDirOrFileNames then
-              ListedItems.Add(TdwlFile.ExtractBareName(SearchRec.Name))
-            else
-              ListedItems.Add(ThePath+SearchRec.Name);
-          end;
-        end
-        else
-          if ListDirectories and (SearchRec.Name<>'.') and (SearchRec.Name<>'..') then
-          begin
-            if BareDirOrFileNames then
-              ListedItems.Add(TdwlFile.ExtractBareName(SearchRec.Name))
-            else
-              ListedItems.Add(ThePath+SearchRec.Name);
-          end;
-      end;
-      SearchResult := FindNext(SearchRec);
-    end;
-  finally
-    System.SysUtils.FindClose(SearchRec);
-  end;
-  if Recursive then // recurse into subdirs
+  if FApplication_TempDir='' then
   begin
-    SearchResult := FindFirst(ThePath+'*.*', faAnyFile, SearchRec);
-    try
-      while SearchResult = 0 do
-      begin
-        if ((SearchRec.Attr and faDirectory)<>0) and (SearchRec.Name<>'.') and
-          (SearchRec.Name<>'..') and ((ExcludeMask='') or
-            not MatchesMask(SearchRec.Name, ExcludeMask)) then
-          Listing(ListedItems, ThePath+SearchRec.Name, Mask, true,
-            ListDirectories, ListFiles, BareDirOrFileNames, ExcludeMask, MaxRecurseDepth-1);
-        SearchResult := FindNext(SearchRec);
-      end;
-    finally
-      System.SysUtils.FindClose(SearchRec);
+    FApplication_TempDir := TPath.GetTempPath+TdwlFile.ExtractBareName(ParamStr(0));
+    ForceDirectories(FApplication_TempDir);
+  end;
+  Result := FApplication_TempDir;
+end;
+
+class procedure TdwlDirectory.Copy(const SourceDirectory, DestinationDirectory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles, ioIncludeDirectories, ioRecurse]);
+begin
+  var ENum := Enumerator(SourceDirectory, Options);
+  while Enum.MoveNext do
+  begin
+    var Dest := DestinationDirectory+IfThen(ENum.Current.RelativeDirectory<>'', '\')+ENum.Current.RelativeDirectory;
+    ForceDirectories(Dest);
+    Dest := Dest+'\'+ENum.Current.Name;
+    if ENum.Current.IsDirectory then
+    begin
+      if not DirectoryExists(Dest) then
+        WinApi.Windows.CreateDirectory(PChar(Dest), nil)
+    end
+    else
+    begin
+      if not Winapi.Windows.CopyFile(PChar(ENum.Current.FullPathName), PChar(Dest), not (ioOverwrite in Options)) then
+        raise Exception.Create('Error copying file to '+Dest+' : '+SysErrorMessage(GetLastError));
+      if (ioRemoveReadOnly in Options) then
+        TdwlFile.SetReadOnlyFlag(Dest, false);
     end;
   end;
+end;
+
+class procedure TdwlDirectory.Delete(const Directory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles, ioIncludeDirectories, ioRecurse]);
+begin
+  Empty(Directory, Options);
+  // Remove the Dir itself
+  if ioRemoveReadOnly in Options then
+    TdwlFile.SetReadOnlyFlag(Directory, false);
+  if not RemoveDirectory(PChar(Directory)) then
+    raise Exception.Create('Error deleting directcory '+Directory+' : '+SysErrorMessage(GetLastError));
+end;
+
+class destructor TdwlDirectory.Destroy;
+begin
+  if FApplication_TempDir<>'' then
+    Delete(FApplication_TempDir);
+  inherited;
+end;
+
+class procedure TdwlDirectory.Empty(const Directory: string; Options: TdwlIOEnumOptions);
+begin
+  if not DirectoryExists(Directory) then
+    Exit;
+  var ENum := Enumerator(Directory, Options);
+  while ENum.MoveNext do
+  begin
+    if ioRemoveReadOnly in Options then
+      TdwlFile.SetReadOnlyFlag(ENum.Current.FullPathName, false);
+    if ENum.Current.IsDirectory then
+    begin
+      if not RemoveDirectory(PChar(ENum.Current.FullPathName)) then
+        raise Exception.Create('Error deleting directory '+ENum.Current.FullPathName+' : '+SysErrorMessage(GetLastError));
+    end
+    else
+    begin
+      if not WinApi.Windows.DeleteFile(PChar(ENum.Current.FullPathName)) then
+        raise Exception.Create('Error deleting file '+ENum.Current.FullPathName+' : '+SysErrorMessage(GetLastError));
+    end;
+  end;
+end;
+
+class function TdwlDirectory.Enumerator(const Directory: string; Options: TdwlIOEnumOptions=[ioIncludeFiles]; const FileMask: string='*.*'): IdwlDirectoryEnumerator;
+begin
+  Result := TdwlDirectoryEnumerator.Create(Directory, Options, FileMask);
+end;
+
+class procedure TdwlDirectory.Move(const FromDirectory, ToDirectory: string; Options: TdwlIOEnumOptions);
+begin
+  var ENum := Enumerator(FromDirectory, Options);
+  while ENum.MoveNext do
+  begin
+    var Dest := ToDirectory+IfThen(ENum.Current.RelativeDirectory<>'', '\')+ENum.Current.RelativeDirectory;
+    ForceDirectories(Dest);
+    Dest := Dest+'\'+ENum.Current.Name;
+    if ENum.Current.IsDirectory then
+    begin
+      if not DirectoryExists(Dest) then
+        WinApi.Windows.CreateDirectory(PChar(Dest), nil)
+    end
+    else
+    begin
+      if not Winapi.Windows.MoveFile(PChar(ENum.Current.FullPathName), PChar(Dest)) then
+        raise Exception.Create('Error moving file to '+Dest+' : '+SysErrorMessage(GetLastError));
+      if (ioRemoveReadOnly in Options) then
+        TdwlFile.SetReadOnlyFlag(Dest, false);
+    end;
+  end;
+  // All files are moved, now Remove directory, including all subdirectories
+  Options := Options-[ioIncludeFiles]+[ioIncludeDirectories];
+  Delete(FromDirectory, Options);
+end;
+
+{ TdwlDirectoryEnumerator }
+
+function TdwlDirectoryEnumerator.Current: PDirEnum;
+begin
+  if FDirEnum.hFind=0 then
+    Result := nil
+  else
+    Result := FDirEnum;
+end;
+
+constructor TdwlDirectoryEnumerator.Create(const Directory: string; Options: TdwlIOEnumOptions; const FileMask: string);
+begin
+  inherited Create;
+  FOptions := Options;
+  FFileMask := FileMask;
+  FDirEnum := TDirEnum.Open(Directory, '');
+end;
+
+destructor TdwlDirectoryEnumerator.Destroy;
+begin
+  while FDirEnum<>nil do
+    TDirEnum.Close(FDirEnum);
+  inherited Destroy;
+end;
+
+function TdwlDirectoryEnumerator.UnfilteredMoveNext: boolean;
+begin
+if FDirEnum.hFind=0 then  // not initialized, initialize and find first file
+  begin
+    var hFind := FindFirstFile(PChar(FDirEnum.Directory+'\'+FFileMask), FDirEnum.FindData);
+    if hFind=INVALID_HANDLE_VALUE  then
+    begin
+      var Err := GetLastError;
+      if Err=ERROR_FILE_NOT_FOUND then // no results found, return
+        Exit(false);
+      raise Exception.Create('Error enumerating '+FDirEnum.Directory+' : '+SysErrorMessage(GetLastError));
+    end;
+    FDirEnum.hFind := hFind;
+    Result := true;
+  end
+  else
+  begin
+    Result := FindNextFile(FDirEnum.hFind, FDirEnum.FindData);
+    if not Result then
+    begin
+      var Err := GetLastError;
+      if Err<>ERROR_NO_MORE_FILES then
+        raise Exception.Create('Error enumerating '+FDirEnum.Directory+' : '+SysErrorMessage(GetLastError));
+      // if there is a parent, recurse back and replace DirEnum with parent
+      // the parent is still pointing at the dir and this dir will become the current
+      // the parent dir has not been visited yet (we recursed first), so leave it there
+      if FDirEnum.Parent<>nil then
+      begin
+        var Me := FDirEnum;
+        FDirEnum := FDirEnum.Parent;
+        TDirEnum.Close(Me);
+        // and now exit here, otherwise we will recurse again into this dir.
+        Exit(true);
+      end;
+    end;
+  end;
+  // Check if result is a directory
+  if Result and FDirEnum.IsDirectory then
+  begin
+    if (FDirEnum.Name='.') or (FDirEnum.Name='..') then // skip these useless entries
+      Result := UnfilteredMoveNext
+    else
+    begin
+      // recurse into directory
+      if (ioRecurse in FOptions) and ((ioIncludeHidden in FOptions) or (((FILE_ATTRIBUTE_HIDDEN+FILE_ATTRIBUTE_SYSTEM) and  FDirEnum.FindData.dwFileAttributes)=0))  then
+      begin
+        var Me := FDirEnum;
+        FDirEnum := TDirEnum.Open(FDirEnum.BaseDirectory, FDirEnum.RelativeDirectory+IfThen(FDirEnum.RelativeDirectory<>'', '\')+FDirEnum.Name);
+        FDirEnum.Parent := Me;
+        // call InternalMoveNext iterative to first get results from child directory
+        Result := UnfilteredMoveNext;
+        if not Result then
+        begin // this worked out to be an empty dir, so step back, don't known if it works in real life, because . and .. seems to be standard returns from a directory
+          TDirEnum.Close(FDirEnum);
+          FDirEnum := Me;
+          Result := true;
+        end;
+      end;
+    end;
+  end;
+end;
+
+function TdwlDirectoryEnumerator.MoveNext: boolean;
+begin
+  Result := UnfilteredMoveNext;
+  while Result do
+  begin
+    // do filtering
+    if (((FILE_ATTRIBUTE_DIRECTORY and FDirEnum.FindData.dwFileAttributes)<>0) and (not (ioIncludeDirectories in FOptions))) or
+      (((FILE_ATTRIBUTE_DIRECTORY and FDirEnum.FindData.dwFileAttributes)=0) and (not (ioIncludeFiles in FOptions))) or
+      ((((FILE_ATTRIBUTE_HIDDEN+FILE_ATTRIBUTE_SYSTEM) and FDirEnum.FindData.dwFileAttributes)>0) and (not (ioIncludeHidden in FOptions))) then
+      Result := UnfilteredMoveNext
+    else
+      Break;
+  end;
+end;
+
+{ TDirEnum }
+
+class procedure TDirEnum.Close(var DirEnum: PDirEnum);
+begin
+  var ParentEnum := DirEnum.Parent;
+  if DirEnum.hFind<>0 then
+    WinApi.Windows.FindClose(DirEnum.hFind);
+  Dispose(DirENum);
+  DirEnum := ParentEnum;
+end;
+
+function TDirEnum.Directory: string;
+begin
+  Result := BaseDirectory+IfThen(RelativeDirectory<>'', '\')+RelativeDirectory;
+end;
+
+function TDirEnum.FullPathName: string;
+begin
+  Result := Directory+'\'+Name;
+end;
+
+function TDirEnum.IsDirectory: boolean;
+begin
+  Result := (FindData.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY)<>0;
+end;
+
+function TDirEnum.IsReadOny: boolean;
+begin
+  Result := (FindData.dwFileAttributes and FILE_ATTRIBUTE_READONLY)>0;
+end;
+
+function TDirEnum.Name: string;
+begin
+  Result := FindData.cFileName;
+end;
+
+class function TDirEnum.Open(const BaseDirectory, RelativeDirectory: string): PDirENum;
+begin
+  New(Result);
+  Result.hFind := 0;
+  Result. BaseDirectory := BaseDirectory;
+  Result. RelativeDirectory := RelativeDirectory;
+  Result.Parent := nil;
+end;
+
+function TDirEnum.RelativePathName: string;
+begin
+  Result := RelativeDirectory+IfThen(RelativeDirectory<>'', '\')+Name;
 end;
 
 end.
